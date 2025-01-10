@@ -39,6 +39,16 @@ func (s *eos) String() string {
 	return fmt.Sprintf("eos://%s/", s.s3client.bucket)
 }
 
+func (s *eos) Limits() Limits {
+	return Limits{
+		IsSupportMultipartUpload: true,
+		IsSupportUploadPartCopy:  true,
+		MinPartSize:              4 << 20,
+		MaxPartSize:              5 << 30,
+		MaxPartCount:             10000,
+	}
+}
+
 func newEos(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {
 	if !strings.Contains(endpoint, "://") {
 		endpoint = fmt.Sprintf("https://%s", endpoint)
@@ -67,7 +77,7 @@ func newEos(endpoint, accessKey, secretKey, token string) (ObjectStorage, error)
 		Endpoint:         &endpoint,
 		Region:           &region,
 		DisableSSL:       aws.Bool(!ssl),
-		S3ForcePathStyle: aws.Bool(true),
+		S3ForcePathStyle: aws.Bool(defaultPathStyle()),
 		HTTPClient:       httpClient,
 		Credentials:      credentials.NewStaticCredentials(accessKey, secretKey, token),
 	}
@@ -77,7 +87,7 @@ func newEos(endpoint, accessKey, secretKey, token string) (ObjectStorage, error)
 		return nil, fmt.Errorf("aws session: %s", err)
 	}
 	ses.Handlers.Build.PushFront(disableSha256Func)
-	return &eos{s3client{bucket, s3.New(ses), ses}}, nil
+	return &eos{s3client{bucket: bucket, s3: s3.New(ses), ses: ses}}, nil
 }
 
 func init() {

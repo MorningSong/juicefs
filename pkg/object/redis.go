@@ -24,7 +24,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
@@ -33,7 +32,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 )
 
 // redisStore stores data chunks into Redis.
@@ -43,8 +42,6 @@ type redisStore struct {
 	uri string
 }
 
-var c = context.TODO()
-
 func (r *redisStore) String() string {
 	return r.uri + "/"
 }
@@ -53,8 +50,8 @@ func (r *redisStore) Create() error {
 	return nil
 }
 
-func (r *redisStore) Get(key string, off, limit int64) (io.ReadCloser, error) {
-	data, err := r.rdb.Get(c, key).Bytes()
+func (r *redisStore) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
+	data, err := r.rdb.Get(ctx, key).Bytes()
 	if err != nil {
 		return nil, err
 	}
@@ -65,22 +62,22 @@ func (r *redisStore) Get(key string, off, limit int64) (io.ReadCloser, error) {
 	if limit > 0 && limit < int64(len(data)) {
 		data = data[:limit]
 	}
-	return ioutil.NopCloser(bytes.NewBuffer(data)), nil
+	return io.NopCloser(bytes.NewBuffer(data)), nil
 }
 
-func (r *redisStore) Put(key string, in io.Reader) error {
-	data, err := ioutil.ReadAll(in)
+func (r *redisStore) Put(key string, in io.Reader, getters ...AttrGetter) error {
+	data, err := io.ReadAll(in)
 	if err != nil {
 		return err
 	}
-	return r.rdb.Set(c, key, data, 0).Err()
+	return r.rdb.Set(ctx, key, data, 0).Err()
 }
 
-func (r *redisStore) Delete(key string) error {
-	return r.rdb.Del(c, key).Err()
+func (r *redisStore) Delete(key string, getters ...AttrGetter) error {
+	return r.rdb.Del(ctx, key).Err()
 }
 
-func (t *redisStore) ListAll(prefix, marker string) (<-chan Object, error) {
+func (t *redisStore) ListAll(prefix, marker string, followLink bool) (<-chan Object, error) {
 	var scanCli []redis.UniversalClient
 	var m sync.Mutex
 	if c, ok := t.rdb.(*redis.ClusterClient); ok {
@@ -132,7 +129,7 @@ func (t *redisStore) ListAll(prefix, marker string) (<-chan Object, error) {
 
 			p := t.rdb.Pipeline()
 			for _, key := range keyList[start:end] {
-				p.StrLen(c, key)
+				p.StrLen(ctx, key)
 			}
 			cmds, err := p.Exec(ctx)
 			if err != nil {
@@ -159,7 +156,7 @@ func (t *redisStore) ListAll(prefix, marker string) (<-chan Object, error) {
 						}
 					}
 					// FIXME: mtime
-					objs <- &obj{keyList[start:end][idx], size, now, strings.HasSuffix(keyList[start:end][idx], "/")}
+					objs <- &obj{keyList[start:end][idx], size, now, strings.HasSuffix(keyList[start:end][idx], "/"), ""}
 				}
 			}
 		}
@@ -177,6 +174,7 @@ func (t *redisStore) Head(key string) (Object, error) {
 		int64(len(data)),
 		time.Now(),
 		strings.HasSuffix(key, "/"),
+		"",
 	}, err
 }
 

@@ -15,6 +15,7 @@
  */
 package io.juicefs;
 
+import io.juicefs.utils.BgTaskUtil;
 import io.juicefs.utils.PatchUtil;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
@@ -29,8 +30,6 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.net.URI;
 import java.security.PrivilegedExceptionAction;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /****************************************************************
@@ -43,8 +42,6 @@ public class JuiceFileSystem extends FilterFileSystem {
 
   private static boolean fileChecksumEnabled = false;
   private static boolean distcpPatched = false;
-
-  private ScheduledExecutorService emptier;
 
   static {
     PatchUtil.patchBefore("org.apache.flink.runtime.fs.hdfs.HadoopRecoverableFsDataOutputStream",
@@ -69,26 +66,27 @@ public class JuiceFileSystem extends FilterFileSystem {
   public void initialize(URI uri, Configuration conf) throws IOException {
     super.initialize(uri, conf);
     fileChecksumEnabled = Boolean.parseBoolean(getConf(conf, "file.checksum", "false"));
-    startTrashEmptier(uri, conf);
+    boolean asBgTask = conf.getBoolean("juicefs.internal-bg-task", false);
+    if (!asBgTask && !Boolean.parseBoolean(getConf(conf, "disable-trash-emptier", "false"))) {
+      BgTaskUtil.startTrashEmptier(uri.getHost(), () -> {
+        runTrashEmptier(uri, conf);
+      }, 10, TimeUnit.MINUTES);
+    }
   }
 
-  private void startTrashEmptier(URI uri, final Configuration conf) throws IOException {
-    emptier = Executors.newScheduledThreadPool(1, r -> {
-      Thread t = new Thread(r, "Trash Emptier");
-      t.setDaemon(true);
-      return t;
-    });
-
+  private void runTrashEmptier(URI uri, final Configuration conf) {
     try {
+      Configuration newConf = new Configuration(conf);
+      newConf.setBoolean("juicefs.internal-bg-task", true);
       UserGroupInformation superUser = UserGroupInformation.createRemoteUser(getConf(conf, "superuser", "hdfs"));
       FileSystem emptierFs = superUser.doAs((PrivilegedExceptionAction<FileSystem>) () -> {
         JuiceFileSystemImpl fs = new JuiceFileSystemImpl();
-        fs.initialize(uri, conf);
+        fs.initialize(uri, newConf);
         return fs;
       });
-      emptier.schedule(new Trash(emptierFs, conf).getEmptier(), 10, TimeUnit.MINUTES);
+      new Trash(emptierFs, newConf).getEmptier().run();
     } catch (Exception e) {
-      throw new IOException("start trash failed!",e);
+      LOG.warn("run trash emptier for {} failed", uri.getHost(), e);
     }
   }
 
@@ -111,7 +109,7 @@ public class JuiceFileSystem extends FilterFileSystem {
   public String getScheme() {
     StackTraceElement[] elements = Thread.currentThread().getStackTrace();
     if (elements[2].getClassName().equals("org.apache.flink.runtime.fs.hdfs.HadoopRecoverableWriter") &&
-            elements[2].getMethodName().equals("<init>")) {
+        (elements[2].getMethodName().equals("<init>") || elements[2].getMethodName().equals("checkSupportedFSSchemes"))) {
       return "hdfs";
     }
     return fs.getScheme();
@@ -149,13 +147,5 @@ public class JuiceFileSystem extends FilterFileSystem {
       return null;
     patchDistCpChecksum();
     return super.getFileChecksum(f);
-  }
-
-  @Override
-  public void close() throws IOException {
-    if (this.emptier != null) {
-      emptier.shutdownNow();
-    }
-    super.close();
   }
 }

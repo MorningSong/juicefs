@@ -33,6 +33,8 @@ func getAtime(fi os.FileInfo) time.Time {
 	}
 }
 
+func dropOSCache(r ReadCloser) {}
+
 func getNlink(fi os.FileInfo) int {
 	return 1
 }
@@ -48,3 +50,5 @@ func getDiskUsage(path string) (uint64, uint64, uint64, uint64) {
 }
 
 func changeMode(dir string, st os.FileInfo, mode os.FileMode) {}
+
+func inRootVolume(dir string) bool { return false }

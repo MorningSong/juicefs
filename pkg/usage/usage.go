@@ -20,7 +20,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"net/http"
 	"time"
@@ -60,7 +60,7 @@ func sendUsage(u usage) error {
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("got %s", resp.Status)
 	}
-	_, err = ioutil.ReadAll(resp.Body)
+	_, err = io.ReadAll(resp.Body)
 	return err
 }
 
@@ -68,7 +68,7 @@ func sendUsage(u usage) error {
 // understand how the community is using it. You can use `--no-usage-report`
 // to disable this.
 func ReportUsage(m meta.Meta, version string) {
-	ctx := meta.Background
+	ctx := meta.Background()
 	var u usage
 	if format, err := m.Load(false); err == nil {
 		u.VolumeID = format.UUID
@@ -80,7 +80,7 @@ func ReportUsage(m meta.Meta, version string) {
 	var start = time.Now()
 	for {
 		var totalSpace, availSpace, iused, iavail uint64
-		_ = m.StatFS(ctx, &totalSpace, &availSpace, &iused, &iavail)
+		_ = m.StatFS(ctx, meta.RootInode, &totalSpace, &availSpace, &iused, &iavail)
 		u.Uptime = int64(time.Since(start).Seconds())
 		u.UsedSpace = int64(totalSpace - availSpace)
 		u.UsedInodes = int64(iused)
@@ -88,6 +88,6 @@ func ReportUsage(m meta.Meta, version string) {
 		if err := sendUsage(u); err != nil {
 			logger.Debugf("send usage: %s", err)
 		}
-		time.Sleep(time.Minute * 10)
+		time.Sleep(time.Hour)
 	}
 }

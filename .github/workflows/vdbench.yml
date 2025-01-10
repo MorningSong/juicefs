@@ -4,43 +4,135 @@ on:
   push:
     branches:
       - 'main'
-      - 'release-**'
-    paths-ignore:
-      - 'docs/**'
-      - '**.md'
+      - 'release-*'
+    paths:
+      - '**/vdbench.yml'
   pull_request:
-    #The branches below must be a subset of the branches above
     branches:
       - 'main'
-      - 'release-**'
-    paths-ignore:
-      - 'docs/**'
-      - '**.md'
-  schedule:
-    - cron: '0 0 * * *'
+      - 'release-*'
+    paths:
+      - '**/vdbench.yml'
   workflow_dispatch:
-  
+    inputs:
+      debug:
+        type: boolean
+        description: "Run the build with tmate debugging enabled"
+        required: false
+        default: false
+  schedule:
+    - cron: '0 17 * * *'
+
 jobs:
   vdbench:
-    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        meta: [ 'redis', 'mysql', 'fdb', 'tikv']
+    runs-on: ubuntu-20.04
+
     steps:        
       - name: Checkout
         uses: actions/checkout@v3
         with:
           fetch-depth: 1
-          
-      - name: Test
-        uses: ./.github/actions/vdbench
+
+      - name: mount coverage dir
+        timeout-minutes: 5
+        uses: ./.github/actions/mount-coverage-dir
         with:
-          meta_url: "redis://localhost/1"
-          
+          mount_point: cover
+          access_key: ${{ secrets.CI_COVERAGE_AWS_AK }}
+          secret_key: ${{ secrets.CI_COVERAGE_AWS_SK }}
+          token: ${{ secrets.CI_COVERAGE_AWS_TOKEN }}
+
+      - name: Set Variable
+        id: vars
+        run: |
+          if [ "${{matrix.meta}}" == "fdb" ]; then
+            echo "target=juicefs.fdb" >> $GITHUB_OUTPUT
+          else
+            echo "target=juicefs" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Remove unused software
+        timeout-minutes: 10
+        run: |
+          echo "before remove unused software"
+          sudo df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          echo "after remove unused software"
+          sudo df -h
+
+      - name: Build
+        timeout-minutes: 10
+        uses: ./.github/actions/build
+        with: 
+          target: ${{steps.vars.outputs.target}}    
+
+      - name: Prepare meta db
+        run: | 
+          chmod +x .github/scripts/start_meta_engine.sh
+          source .github/scripts/start_meta_engine.sh
+          start_meta_engine ${{matrix.meta}}
+          meta_url=$(get_meta_url ${{matrix.meta}})
+          create_database $meta_url
+
+      - name: Install tools
+        shell: bash
+        run: |
+          wget -q https://dl.minio.io/client/mc/release/linux-amd64/mc
+          chmod +x mc 
+          wget -q https://s.juicefs.com/static/bench/vdbench50407.zip
+          unzip vdbench50407.zip -d vdbench
+
+      - name: vdbench-long-run
+        shell: bash
+        run: |
+          source .github/scripts/start_meta_engine.sh
+          meta_url=$(get_meta_url ${{matrix.meta}})
+          GOCOVERDIR=$(pwd)/cover ./juicefs format $meta_url vdbench-long-run --trash-days 0
+          GOCOVERDIR=$(pwd)/cover ./juicefs mount -d $meta_url /tmp/jfs --no-usage-report --cache-size 1024 --max-deletes 50
+          vdbench/vdbench -f .github/workflows/resources/vdbench_long_run.conf -jn
+
+      - uses: actions/upload-artifact@v3
+        with:
+          name: output-long-run
+          path: output
+
+      - name: check vdbench log
+        if: always()
+        run: |
+          grep -i "java.lang.RuntimeException" output/errorlog.html && exit 1 || true
+          if ! grep -q "Vdbench execution completed successfully" output/logfile.html; then
+            echo "vdbench not completed succeed"
+            exit 1
+          fi
+
+      - name: log
+        if: always()
+        run: | 
+          tail -300 ~/.juicefs/juicefs.log
+          grep "<FATAL>:" ~/.juicefs/juicefs.log && exit 1 || true
+
+      - name: upload coverage report
+        timeout-minutes: 5
+        uses: ./.github/actions/upload-coverage
+        with:
+          UPLOAD_TOKEN: ${{ secrets.CI_COVERAGE_FILE_UPLOAD_AUTH_TOKEN }} 
+
       - name: Send Slack Notification
-        if: ${{ failure() }}
+        if: failure()
         uses: juicedata/slack-notify-action@main
         with:
           channel-id: "${{ secrets.SLACK_CHANNEL_ID_FOR_PR_CHECK_NOTIFY }}"
           slack_bot_token: "${{ secrets.SLACK_BOT_TOKEN }}"          
 
       - name: Setup upterm session
-        if: ${{ failure() }}
+        if: failure() && (github.event.inputs.debug == 'true' || github.run_attempt != 1)
+        # if: failure()
+        timeout-minutes: 60
         uses: lhotari/action-upterm@v1

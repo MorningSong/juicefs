@@ -23,17 +23,23 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 
 	"github.com/erikdubbelboer/gspt"
-	"github.com/google/gops/agent"
+	"github.com/google/uuid"
+	"github.com/grafana/pyroscope-go"
+	_ "github.com/grafana/pyroscope-go/godeltaprof/http/pprof"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
-	"github.com/pyroscope-io/client/pyroscope"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
+	"go.uber.org/automaxprocs/maxprocs"
 )
 
 var logger = utils.GetLogger("juicefs")
+var debugAgent string
+var debugAgentOnce sync.Once
 
 func Main(args []string) error {
 	// we have to call this because gspt removes all arguments
@@ -53,9 +59,11 @@ func Main(args []string) error {
 		Commands: []*cli.Command{
 			cmdFormat(),
 			cmdConfig(),
+			cmdQuota(),
 			cmdDestroy(),
 			cmdGC(),
 			cmdFsck(),
+			cmdRestore(),
 			cmdDump(),
 			cmdLoad(),
 			cmdVersion(),
@@ -73,39 +81,60 @@ func Main(args []string) error {
 			cmdWarmup(),
 			cmdRmr(),
 			cmdSync(),
+			cmdDebug(),
+			cmdClone(),
+			cmdSummary(),
+			cmdCompact(),
 		},
 	}
 
 	if calledViaMount(args) {
-		args = handleSysMountArgs(args)
+		var err error
+		args, err = handleSysMountArgs(args)
+		if err != nil {
+			return err
+		}
 		if len(args) < 1 {
-			args = []string{"--help"}
+			args = []string{"mount", "--help"}
 		}
 	}
-	return app.Run(reorderOptions(app, args))
+	err := app.Run(reorderOptions(app, args))
+	if errno, ok := err.(syscall.Errno); ok && errno == 0 {
+		err = nil
+	}
+	return err
 }
 
 func calledViaMount(args []string) bool {
-	return strings.HasSuffix(args[0], "/mount.juicefs")
+	if os.Getenv("CALL_VIA_MOUNT") != "" {
+		return true
+	}
+	if strings.HasSuffix(args[0], "/mount.juicefs") {
+		os.Setenv("CALL_VIA_MOUNT", "1")
+		return true
+	}
+	return false
 }
 
-func handleSysMountArgs(args []string) []string {
+func handleSysMountArgs(args []string) ([]string, error) {
 	optionToCmdFlag := map[string]string{
 		"attrcacheto":     "attr-cache",
 		"entrycacheto":    "entry-cache",
 		"direntrycacheto": "dir-entry-cache",
 	}
 	newArgs := []string{"juicefs", "mount", "-d"}
-	if len(args) < 4 {
-		return nil
+	if len(args) < 3 {
+		return nil, nil
 	}
 	mountOptions := args[3:]
 	sysOptions := []string{"_netdev", "rw", "defaults", "remount"}
 	fuseOptions := make([]string, 0, 20)
 	cmdFlagsLookup := make(map[string]bool, 20)
 	for _, f := range append(cmdMount().Flags, globalFlags()...) {
-		if names := f.Names(); len(names) > 0 && len(names[0]) > 1 {
-			_, cmdFlagsLookup[names[0]] = f.(*cli.BoolFlag)
+		for _, name := range f.Names() {
+			if len(name) > 1 {
+				_, cmdFlagsLookup[name] = f.(*cli.BoolFlag)
+			}
 		}
 	}
 
@@ -130,14 +159,17 @@ func handleSysMountArgs(args []string) []string {
 				fields := strings.SplitN(opt, "=", 2)
 				if flagName, ok := optionToCmdFlag[fields[0]]; ok {
 					newArgs = append(newArgs, fmt.Sprintf("--%s=%s", flagName, fields[1]))
-				} else if isBool, ok := cmdFlagsLookup[fields[0]]; ok && !isBool {
+				} else if _, ok := cmdFlagsLookup[fields[0]]; ok {
 					newArgs = append(newArgs, fmt.Sprintf("--%s=%s", fields[0], fields[1]))
 				} else {
 					fuseOptions = append(fuseOptions, opt)
 				}
 			} else if flagName, ok := optionToCmdFlag[opt]; ok {
 				newArgs = append(newArgs, fmt.Sprintf("--%s", flagName))
-			} else if isBool, ok := cmdFlagsLookup[opt]; ok && isBool {
+			} else if isBool, ok := cmdFlagsLookup[opt]; ok {
+				if !isBool {
+					return nil, fmt.Errorf("option %s requires a value", opt)
+				}
 				newArgs = append(newArgs, fmt.Sprintf("--%s", opt))
 				if opt == "debug" {
 					fuseOptions = append(fuseOptions, opt)
@@ -154,7 +186,7 @@ func handleSysMountArgs(args []string) []string {
 	}
 	newArgs = append(newArgs, args[1], args[2])
 	logger.Debug("Parsed mount args: ", strings.Join(newArgs, " "))
-	return newArgs
+	return newArgs, nil
 }
 
 func isFlag(flags []cli.Flag, option string) (bool, bool) {
@@ -184,6 +216,9 @@ func reorderOptions(app *cli.App, args []string) []string {
 			newArgs = append(newArgs, option)
 			if hasValue {
 				i++
+				if i >= len(args) {
+					logger.Fatalf("option %s requires value", option)
+				}
 				newArgs = append(newArgs, args[i])
 			}
 		} else {
@@ -199,6 +234,7 @@ func reorderOptions(app *cli.App, args []string) []string {
 	for _, c := range app.Commands {
 		if c.Name == cmdName {
 			cmd = c
+			break
 		}
 	}
 	if cmd == nil {
@@ -236,30 +272,56 @@ func setup(c *cli.Context, n int) {
 		os.Exit(1)
 	}
 
-	if c.Bool("trace") {
+	switch c.String("log-level") {
+	case "trace":
 		utils.SetLogLevel(logrus.TraceLevel)
-	} else if c.Bool("verbose") {
+	case "debug":
 		utils.SetLogLevel(logrus.DebugLevel)
-	} else if c.Bool("quiet") {
-		utils.SetLogLevel(logrus.WarnLevel)
-	} else {
+	case "info":
 		utils.SetLogLevel(logrus.InfoLevel)
+	case "warn":
+		utils.SetLogLevel(logrus.WarnLevel)
+	case "error":
+		utils.SetLogLevel(logrus.ErrorLevel)
+	case "fatal":
+		utils.SetLogLevel(logrus.FatalLevel)
+	case "panic":
+		utils.SetLogLevel(logrus.PanicLevel)
+	default:
+		if c.Bool("trace") {
+			utils.SetLogLevel(logrus.TraceLevel)
+		} else if c.Bool("verbose") {
+			utils.SetLogLevel(logrus.DebugLevel)
+		} else if c.Bool("quiet") {
+			utils.SetLogLevel(logrus.WarnLevel)
+		} else {
+			utils.SetLogLevel(logrus.InfoLevel)
+		}
 	}
 	if c.Bool("no-color") {
 		utils.DisableLogColor()
 	}
+	// set the correct value when it runs inside container
+	if undo, err := maxprocs.Set(maxprocs.Logger(logger.Debugf)); err != nil {
+		undo()
+	}
+
+	logID := c.String("log-id")
+	if logID != "" {
+		if logID == "random" {
+			logID = uuid.New().String()
+		}
+		utils.SetLogID("[" + logID + "] ")
+	}
 
 	if !c.Bool("no-agent") {
-		go func() {
+		go debugAgentOnce.Do(func() {
 			for port := 6060; port < 6100; port++ {
-				_ = http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", port), nil)
+				debugAgent = fmt.Sprintf("127.0.0.1:%d", port)
+				logger.Debugf("Debug agent listening on %s", debugAgent)
+				_ = http.ListenAndServe(debugAgent, nil)
 			}
-		}()
-		go func() {
-			for port := 6070; port < 6100; port++ {
-				_ = agent.Listen(agent.Options{Addr: fmt.Sprintf("127.0.0.1:%d", port)})
-			}
-		}()
+		})
 	}
 
 	if c.IsSet("pyroscope") {
@@ -274,33 +336,37 @@ func setup(c *cli.Context, n int) {
 		tags["pid"] = strconv.Itoa(os.Getpid())
 		tags["version"] = version.Version()
 
+		types := []pyroscope.ProfileType{pyroscope.ProfileCPU, pyroscope.ProfileInuseObjects, pyroscope.ProfileAllocObjects,
+			pyroscope.ProfileInuseSpace, pyroscope.ProfileAllocSpace, pyroscope.ProfileGoroutines, pyroscope.ProfileMutexCount,
+			pyroscope.ProfileMutexDuration, pyroscope.ProfileBlockCount, pyroscope.ProfileBlockDuration}
 		if _, err := pyroscope.Start(pyroscope.Config{
 			ApplicationName: appName,
 			ServerAddress:   c.String("pyroscope"),
 			Logger:          logger,
 			Tags:            tags,
 			AuthToken:       os.Getenv("PYROSCOPE_AUTH_TOKEN"),
-			ProfileTypes:    pyroscope.DefaultProfileTypes,
+			ProfileTypes:    types,
 		}); err != nil {
 			logger.Errorf("start pyroscope agent: %v", err)
 		}
 	}
 }
 
-func removePassword(uri string) {
-	var uri2 string
-	if strings.Contains(uri, "://") {
-		uri2 = utils.RemovePassword(uri)
-	} else {
-		uri2 = utils.RemovePassword("redis://" + uri)
-	}
-	if uri2 != uri {
-		for i, a := range os.Args {
-			if a == uri {
-				os.Args[i] = uri2
-				break
+func removePassword(uris ...string) {
+	args := make([]string, len(os.Args))
+	copy(args, os.Args)
+	var idx int
+	for _, uri := range uris {
+		uri2 := utils.RemovePassword(uri)
+		if uri2 != uri {
+			for i := idx; i < len(os.Args); i++ {
+				if os.Args[i] == uri {
+					args[i] = uri2
+					idx = i + 1
+					break
+				}
 			}
 		}
 	}
-	gspt.SetProcTitle(strings.Join(os.Args, " "))
+	gspt.SetProcTitle(strings.Join(args, " "))
 }

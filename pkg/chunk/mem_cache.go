@@ -22,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
+	"github.com/dustin/go-humanize"
 )
 
 type memItem struct {
@@ -32,37 +32,24 @@ type memItem struct {
 
 type memcache struct {
 	sync.Mutex
-	capacity int64
-	used     int64
-	pages    map[string]memItem
+	capacity    int64
+	maxItems    int64
+	used        int64
+	pages       map[string]memItem
+	eviction    string
+	cacheExpire time.Duration
 
-	cacheWrites     prometheus.Counter
-	cacheEvicts     prometheus.Counter
-	cacheWriteBytes prometheus.Counter
+	metrics *cacheManagerMetrics
 }
 
-func newMemStore(config *Config, reg prometheus.Registerer) *memcache {
+func newMemStore(config *Config, metrics *cacheManagerMetrics) *memcache {
 	c := &memcache{
-		capacity: config.CacheSize << 20,
-		pages:    make(map[string]memItem),
-
-		cacheWrites: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "blockcache_writes",
-			Help: "written cached block",
-		}),
-		cacheEvicts: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "blockcache_evicts",
-			Help: "evicted cache blocks",
-		}),
-		cacheWriteBytes: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "blockcache_write_bytes",
-			Help: "write bytes of cached block",
-		}),
-	}
-	if reg != nil {
-		reg.MustRegister(c.cacheWrites)
-		reg.MustRegister(c.cacheWriteBytes)
-		reg.MustRegister(c.cacheEvicts)
+		capacity:    int64(config.CacheSize),
+		maxItems:    config.CacheItems,
+		pages:       make(map[string]memItem),
+		eviction:    config.CacheEviction,
+		cacheExpire: config.CacheExpire,
+		metrics:     metrics,
 	}
 	runtime.SetFinalizer(c, func(c *memcache) {
 		for _, p := range c.pages {
@@ -70,7 +57,14 @@ func newMemStore(config *Config, reg prometheus.Registerer) *memcache {
 		}
 		c.pages = nil
 	})
+	if c.cacheExpire > 0 {
+		go c.cleanupExpire()
+	}
 	return c
+}
+
+func (c *memcache) removeStage(key string) error {
+	return nil
 }
 
 func (c *memcache) usedMemory() int64 {
@@ -85,22 +79,27 @@ func (c *memcache) stats() (int64, int64) {
 	return int64(len(c.pages)), c.used
 }
 
-func (c *memcache) cache(key string, p *Page, force bool) {
-	if c.capacity == 0 {
+func (c *memcache) cache(key string, p *Page, force, dropCache bool) {
+	if !c.enabled() {
 		return
 	}
 	c.Lock()
 	defer c.Unlock()
+	if c.full() && c.eviction == "none" {
+		logger.Debugf("Caching is full, drop %s (%d bytes)", key, len(p.Data))
+		c.metrics.cacheDrops.Add(1)
+		return
+	}
 	if _, ok := c.pages[key]; ok {
 		return
 	}
 	size := int64(cap(p.Data))
-	c.cacheWrites.Add(1)
-	c.cacheWriteBytes.Add(float64(size))
+	c.metrics.cacheWrites.Add(1)
+	c.metrics.cacheWriteBytes.Add(float64(size))
 	p.Acquire()
 	c.pages[key] = memItem{time.Now(), p}
 	c.used += size
-	if c.used > c.capacity {
+	if c.full() && c.eviction != "none" {
 		c.cleanup()
 	}
 }
@@ -112,7 +111,7 @@ func (c *memcache) delete(key string, p *Page) {
 	delete(c.pages, key)
 }
 
-func (c *memcache) remove(key string) {
+func (c *memcache) remove(key string, staging bool) {
 	c.Lock()
 	defer c.Unlock()
 	if item, ok := c.pages[key]; ok {
@@ -131,6 +130,19 @@ func (c *memcache) load(key string) (ReadCloser, error) {
 	return nil, errors.New("not found")
 }
 
+func (c *memcache) exist(key string) bool {
+	if !c.enabled() {
+		return false
+	}
+	c.Lock()
+	defer c.Unlock()
+	if item, ok := c.pages[key]; ok {
+		c.pages[key] = memItem{time.Now(), item.page}
+		return true
+	}
+	return false
+}
+
 // locked
 func (c *memcache) cleanup() {
 	var cnt int
@@ -146,18 +158,57 @@ func (c *memcache) cleanup() {
 		cnt++
 		if cnt > 1 {
 			logger.Debugf("remove %s from cache, age: %d", lastKey, now.Sub(lastValue.atime))
-			c.cacheEvicts.Add(1)
+			c.metrics.cacheEvicts.Add(1)
 			c.delete(lastKey, lastValue.page)
 			cnt = 0
-			if c.used < c.capacity {
+			if !c.full() {
 				break
 			}
 		}
 	}
 }
 
+func (c *memcache) enabled() bool {
+	return c.capacity > 0
+}
+
+func (c *memcache) full() bool {
+	return c.used > c.capacity || (c.maxItems != 0 && int64(len(c.pages)) > c.maxItems)
+}
+
+func (c *memcache) cleanupExpire() {
+	var interval = time.Minute
+	if c.cacheExpire < time.Minute {
+		interval = c.cacheExpire
+	}
+	for {
+		var freed int64
+		var cnt, deleted int
+		c.Lock()
+		cutoff := time.Now().Add(-c.cacheExpire)
+		for k, v := range c.pages {
+			cnt++
+			if cnt > 1e3 {
+				break
+			}
+			if v.atime.Before(cutoff) {
+				deleted++
+				freed += int64(cap(v.page.Data))
+				c.metrics.cacheEvicts.Add(1)
+				c.delete(k, v.page)
+			}
+		}
+		c.Unlock()
+		if deleted > 0 {
+			logger.Debugf("Expired cache blocks: %d blocks (%s), remaining: %d blocks (%s)", deleted, humanize.IBytes(uint64(freed)), len(c.pages), humanize.IBytes(uint64(c.used)))
+		}
+		time.Sleep(interval * time.Duration((cnt+1-deleted)/(cnt+1)))
+	}
+}
+
 func (c *memcache) stage(key string, data []byte, keepCache bool) (string, error) {
 	return "", errors.New("not supported")
 }
-func (c *memcache) uploaded(key string, size int) {}
-func (c *memcache) stagePath(key string) string   { return "" }
+func (c *memcache) uploaded(key string, size int)    {}
+func (c *memcache) isEmpty() bool                    { return false }
+func (c *memcache) getMetrics() *cacheManagerMetrics { return c.metrics }

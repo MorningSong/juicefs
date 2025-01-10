@@ -20,9 +20,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
-	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	osync "github.com/juicedata/juicefs/pkg/sync"
@@ -43,28 +41,56 @@ It scans all objects in data storage and slices in metadata, comparing them to s
 lost object or broken file.
 
 Examples:
-$ juicefs fsck redis://localhost`,
+$ juicefs fsck redis://localhost
+
+# Repair broken directories
+$ juicefs fsck redis://localhost --path /d1/d2 --repair
+
+# recursively check
+$ juicefs fsck redis://localhost --path /d1/d2 --recursive`,
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:  "path",
+				Usage: "absolute path within JuiceFS to check",
+			},
+			&cli.BoolFlag{
+				Name:  "repair",
+				Usage: "repair specified path if it's broken",
+			},
+			&cli.BoolFlag{
+				Name:    "recursive",
+				Aliases: []string{"r"},
+				Usage:   "recursively check or repair",
+			},
+			&cli.BoolFlag{
+				Name:  "sync-dir-stat",
+				Usage: "sync stat of all directories, even if they are existed and not broken (NOTE: it may take a long time for huge trees)",
+			},
+		},
 	}
 }
 
 func fsck(ctx *cli.Context) error {
 	setup(ctx, 1)
+	if ctx.Bool("repair") && ctx.String("path") == "" {
+		logger.Fatalf("Please provide the path to repair with `--path` option")
+	}
 	removePassword(ctx.Args().Get(0))
-	m := meta.NewClient(ctx.Args().Get(0), &meta.Config{Retries: 10, Strict: true})
+	m := meta.NewClient(ctx.Args().Get(0), nil)
 	format, err := m.Load(true)
 	if err != nil {
 		logger.Fatalf("load setting: %s", err)
 	}
-
-	chunkConf := chunk.Config{
-		BlockSize:  format.BlockSize * 1024,
-		Compress:   format.Compression,
-		GetTimeout: time.Second * 60,
-		PutTimeout: time.Second * 60,
-		MaxUpload:  20,
-		BufferSize: 300 << 20,
-		CacheDir:   "memory",
+	var c = meta.NewContext(0, 0, []uint32{0})
+	if p := ctx.String("path"); p != "" {
+		if !strings.HasPrefix(p, "/") {
+			logger.Fatalf("File path should be the absolute path within JuiceFS")
+		}
+		return m.Check(c, p, ctx.Bool("repair"), ctx.Bool("recursive"), ctx.Bool("sync-dir-stat"))
 	}
+
+	chunkConf := *getDefaultChunkConf(format)
+	chunkConf.CacheDir = "memory"
 
 	blob, err := createStorage(*format)
 	if err != nil {
@@ -72,13 +98,13 @@ func fsck(ctx *cli.Context) error {
 	}
 	logger.Infof("Data use %s", blob)
 	blob = object.WithPrefix(blob, "chunks/")
-	objs, err := osync.ListAll(blob, "", "")
+	objs, err := osync.ListAll(blob, "", "", "", true)
 	if err != nil {
 		logger.Fatalf("list all blocks: %s", err)
 	}
 
 	// Find all blocks in object storage
-	progress := utils.NewProgress(false, false)
+	progress := utils.NewProgress(false)
 	blockDSpin := progress.AddDoubleSpinner("Found blocks")
 	var blocks = make(map[string]int64)
 	for obj := range objs {
@@ -106,20 +132,35 @@ func fsck(ctx *cli.Context) error {
 
 	// List all slices in metadata engine
 	sliceCSpin := progress.AddCountSpinner("Listed slices")
-	var c = meta.NewContext(0, 0, []uint32{0})
 	slices := make(map[meta.Ino][]meta.Slice)
-	r := m.ListSlices(c, slices, false, sliceCSpin.Increment)
+	r := m.ListSlices(c, slices, false, false, sliceCSpin.Increment)
 	if r != 0 {
 		logger.Fatalf("list all slices: %s", r)
 	}
 	sliceCSpin.Done()
+	delfilesSpin := progress.AddCountSpinner("Deleted files")
+	delfiles := make(map[meta.Ino]bool)
+	err = m.ScanDeletedObject(c, nil, nil, nil, func(ino meta.Ino, size uint64, ts int64) (clean bool, err error) {
+		delfilesSpin.Increment()
+		delfiles[ino] = true
+		return false, nil
+	})
+	if err != nil {
+		logger.Warnf("scan deleted objects: %s", err)
+	}
+	delfilesSpin.Done()
 
 	// Scan all slices to find lost blocks
+	skippedSlices := progress.AddCountSpinner("Skipped slices")
 	sliceCBar := progress.AddCountBar("Scanned slices", sliceCSpin.Current())
 	sliceBSpin := progress.AddByteSpinner("Scanned slices")
 	lostDSpin := progress.AddDoubleSpinner("Lost blocks")
 	brokens := make(map[meta.Ino]string)
 	for inode, ss := range slices {
+		if delfiles[inode] {
+			skippedSlices.IncrBy(len(ss))
+			continue
+		}
 		for _, s := range ss {
 			n := (s.Size - 1) / uint32(chunkConf.BlockSize)
 			for i := uint32(0); i <= n; i++ {
@@ -137,7 +178,7 @@ func fsck(ctx *cli.Context) error {
 					}
 					if _, err := blob.Head(objKey); err != nil {
 						if _, ok := brokens[inode]; !ok {
-							if ps := meta.GetPaths(m, meta.Background, inode); len(ps) > 0 {
+							if ps := m.GetPaths(meta.Background(), inode); len(ps) > 0 {
 								brokens[inode] = ps[0]
 							} else {
 								brokens[inode] = fmt.Sprintf("inode:%d", inode)

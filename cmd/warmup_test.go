@@ -33,7 +33,7 @@ func TestWarmup(t *testing.T) {
 	if err := os.WriteFile(fmt.Sprintf("%s/f1.txt", testMountPoint), []byte("test"), 0644); err != nil {
 		t.Fatalf("write file failed: %s", err)
 	}
-	m := meta.NewClient(testMeta, &meta.Config{Retries: 10, Strict: true})
+	m := meta.NewClient(testMeta, nil)
 	format, err := m.Load(true)
 	if err != nil {
 		t.Fatalf("load setting err: %s", err)
@@ -65,7 +65,7 @@ func TestWarmup(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	filePath = fmt.Sprintf("%s/%s/raw/chunks/0/0/1_0_4", cacheDir, uuid)
 	content, err := os.ReadFile(filePath)
-	if err != nil || string(content) != "test" {
+	if err != nil || len(content) < 4 || string(content[:4]) != "test" {
 		t.Fatalf("warmup: %s; got content %s", err, content)
 	}
 }

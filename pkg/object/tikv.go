@@ -24,7 +24,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"strings"
@@ -46,7 +45,7 @@ func (t *tikv) String() string {
 	return fmt.Sprintf("tikv://%s/", t.addr)
 }
 
-func (t *tikv) Get(key string, off, limit int64) (io.ReadCloser, error) {
+func (t *tikv) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
 	d, err := t.c.Get(context.TODO(), []byte(key))
 	if len(d) == 0 {
 		err = os.ErrNotExist
@@ -61,11 +60,11 @@ func (t *tikv) Get(key string, off, limit int64) (io.ReadCloser, error) {
 	if limit > 0 && limit < int64(len(data)) {
 		data = data[:limit]
 	}
-	return ioutil.NopCloser(bytes.NewBuffer(data)), nil
+	return io.NopCloser(bytes.NewBuffer(data)), nil
 }
 
-func (t *tikv) Put(key string, in io.Reader) error {
-	d, err := ioutil.ReadAll(in)
+func (t *tikv) Put(key string, in io.Reader, getters ...AttrGetter) error {
+	d, err := io.ReadAll(in)
 	if err != nil {
 		return err
 	}
@@ -82,14 +81,18 @@ func (t *tikv) Head(key string) (Object, error) {
 		int64(len(data)),
 		time.Now(),
 		strings.HasSuffix(key, "/"),
+		"",
 	}, err
 }
 
-func (t *tikv) Delete(key string) error {
+func (t *tikv) Delete(key string, getters ...AttrGetter) error {
 	return t.c.Delete(context.TODO(), []byte(key))
 }
 
-func (t *tikv) List(prefix, marker string, limit int64) ([]Object, error) {
+func (t *tikv) List(prefix, marker, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
+	if delimiter != "" {
+		return nil, false, "", notSupported
+	}
 	if marker == "" {
 		marker = prefix
 	}
@@ -99,15 +102,15 @@ func (t *tikv) List(prefix, marker string, limit int64) ([]Object, error) {
 	// TODO: key only
 	keys, vs, err := t.c.Scan(context.TODO(), []byte(marker), nil, int(limit))
 	if err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
-	var objs []Object = make([]Object, len(keys))
+	var objs = make([]Object, len(keys))
 	mtime := time.Now()
 	for i, k := range keys {
 		// FIXME: mtime
-		objs[i] = &obj{string(k), int64(len(vs[i])), mtime, strings.HasSuffix(string(k), "/")}
+		objs[i] = &obj{string(k), int64(len(vs[i])), mtime, strings.HasSuffix(string(k), "/"), ""}
 	}
-	return objs, nil
+	return generateListResult(objs, limit)
 }
 
 func newTiKV(endpoint, accesskey, secretkey, token string) (ObjectStorage, error) {
@@ -127,7 +130,10 @@ func newTiKV(endpoint, accesskey, secretkey, token string) (ObjectStorage, error
 	l, prop, _ := plog.InitLogger(&plog.Config{Level: plvl})
 	plog.ReplaceGlobals(l, prop)
 
-	tUrl, err := url.Parse("tikv://" + endpoint)
+	if !strings.HasPrefix(endpoint, "tikv://") {
+		endpoint = "tikv://" + endpoint
+	}
+	tUrl, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, err
 	}

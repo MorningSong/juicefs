@@ -21,9 +21,10 @@ package meta
 
 import (
 	"bytes"
+	"context"
 	"time"
 
-	badger "github.com/dgraph-io/badger/v3"
+	badger "github.com/dgraph-io/badger/v4"
 	"github.com/juicedata/juicefs/pkg/utils"
 )
 
@@ -55,71 +56,33 @@ func (tx *badgerTxn) gets(keys ...[]byte) [][]byte {
 	return values
 }
 
-func (tx *badgerTxn) scanRange(begin, end []byte) map[string][]byte {
-	it := tx.t.NewIterator(badger.IteratorOptions{
-		PrefetchValues: true,
-		PrefetchSize:   1024,
-	})
+func (tx *badgerTxn) scan(begin, end []byte, keysOnly bool, handler func(k, v []byte) bool) {
+	var prefix bool
+	var options = badger.IteratorOptions{}
+	if bytes.Equal(nextKey(begin), end) {
+		prefix = true
+		options.Prefix = begin
+	}
+	it := tx.t.NewIterator(options)
+	if prefix {
+		it.Rewind()
+	} else {
+		it.Seek(begin)
+	}
 	defer it.Close()
-	var ret = make(map[string][]byte)
-	for it.Seek(begin); it.Valid(); it.Next() {
+	for ; it.Valid(); it.Next() {
 		item := it.Item()
-		key := item.Key()
-		if bytes.Compare(key, end) >= 0 {
+		if !prefix && bytes.Compare(item.Key(), end) >= 0 {
 			break
 		}
-		var value []byte
 		value, err := item.ValueCopy(nil)
 		if err != nil {
 			panic(err)
 		}
-		ret[string(key)] = value
-	}
-	return ret
-}
-
-func (tx *badgerTxn) scanKeys(prefix []byte) [][]byte {
-	it := tx.t.NewIterator(badger.IteratorOptions{
-		PrefetchValues: false,
-		PrefetchSize:   1024,
-		Prefix:         prefix,
-	})
-	defer it.Close()
-	var ret [][]byte
-	for it.Rewind(); it.Valid(); it.Next() {
-		ret = append(ret, it.Item().KeyCopy(nil))
-	}
-	return ret
-}
-
-func (tx *badgerTxn) scanValues(prefix []byte, limit int, filter func(k, v []byte) bool) map[string][]byte {
-	if limit == 0 {
-		return nil
-	}
-
-	it := tx.t.NewIterator(badger.IteratorOptions{
-		PrefetchValues: true,
-		PrefetchSize:   1024,
-		Prefix:         prefix,
-	})
-	defer it.Close()
-	var ret = make(map[string][]byte)
-	for it.Rewind(); it.Valid(); it.Next() {
-		item := it.Item()
-		value, err := item.ValueCopy(nil)
-		if err != nil {
-			panic(err)
-		}
-		if filter == nil || filter(item.Key(), value) {
-			ret[string(item.Key())] = value
-			if limit > 0 {
-				if limit--; limit == 0 {
-					break
-				}
-			}
+		if !handler(item.KeyCopy(nil), value) {
+			break
 		}
 	}
-	return ret
 }
 
 func (tx *badgerTxn) exist(prefix []byte) bool {
@@ -147,10 +110,9 @@ func (tx *badgerTxn) set(key, value []byte) {
 	}
 }
 
-func (tx *badgerTxn) append(key []byte, value []byte) []byte {
+func (tx *badgerTxn) append(key []byte, value []byte) {
 	list := append(tx.get(key), value...)
 	tx.set(key, list)
-	return list
 }
 
 func (tx *badgerTxn) incrBy(key []byte, value int64) int64 {
@@ -163,11 +125,9 @@ func (tx *badgerTxn) incrBy(key []byte, value int64) int64 {
 	return newCounter
 }
 
-func (tx *badgerTxn) dels(keys ...[]byte) {
-	for _, key := range keys {
-		if err := tx.t.Delete(key); err != nil {
-			panic(err)
-		}
+func (tx *badgerTxn) delete(key []byte) {
+	if err := tx.t.Delete(key); err != nil {
+		panic(err)
 	}
 }
 
@@ -184,9 +144,13 @@ func (c *badgerClient) shouldRetry(err error) bool {
 	return err == badger.ErrConflict
 }
 
-func (c *badgerClient) txn(f func(kvTxn) error) (err error) {
-	tx := c.client.NewTransaction(true)
-	defer tx.Discard()
+func (c *badgerClient) config(key string) interface{} {
+	return nil
+}
+
+func (c *badgerClient) txn(ctx context.Context, f func(*kvTxn) error, retry int) (err error) {
+	t := c.client.NewTransaction(true)
+	defer t.Discard()
 	defer func() {
 		if r := recover(); r != nil {
 			fe, ok := r.(error)
@@ -197,13 +161,13 @@ func (c *badgerClient) txn(f func(kvTxn) error) (err error) {
 			}
 		}
 	}()
-	txn := &badgerTxn{tx, c.client}
-	err = f(txn)
+	tx := &badgerTxn{t, c.client}
+	err = f(&kvTxn{tx, retry})
 	if err != nil {
 		return err
 	}
 	// tx could be committed
-	return txn.t.Commit()
+	return tx.t.Commit()
 }
 
 func (c *badgerClient) scan(prefix []byte, handler func(key []byte, value []byte)) error {
@@ -227,30 +191,10 @@ func (c *badgerClient) scan(prefix []byte, handler func(key []byte, value []byte
 }
 
 func (c *badgerClient) reset(prefix []byte) error {
-	for {
-		tx := c.client.NewTransaction(true)
-		defer tx.Discard()
-		it := tx.NewIterator(badger.IteratorOptions{
-			Prefix:       prefix,
-			PrefetchSize: 1024,
-		})
-		it.Rewind()
-		if !it.Valid() {
-			it.Close()
-			return nil
-		}
-		for ; it.Valid(); it.Next() {
-			if err := tx.Delete(it.Item().Key()); err == badger.ErrTxnTooBig {
-				break
-			} else if err != nil {
-				it.Close()
-				return err
-			}
-		}
-		it.Close()
-		if err := tx.Commit(); err != nil {
-			return err
-		}
+	if prefix == nil {
+		return c.client.DropAll()
+	} else {
+		return c.client.DropPrefix(prefix)
 	}
 }
 
@@ -259,9 +203,12 @@ func (c *badgerClient) close() error {
 	return c.client.Close()
 }
 
+func (c *badgerClient) gc() {}
+
 func newBadgerClient(addr string) (tkvClient, error) {
 	opt := badger.DefaultOptions(addr)
 	opt.Logger = utils.GetLogger("badger")
+	opt.MetricsEnabled = false
 	client, err := badger.Open(opt)
 	if err != nil {
 		return nil, err

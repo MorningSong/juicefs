@@ -47,6 +47,11 @@ $ juicefs destroy redis://localhost e94d66a8-2339-4abd-b8d8-6812df737892
 Details: https://juicefs.com/docs/community/administration/destroy`,
 		Flags: []cli.Flag{
 			&cli.BoolFlag{
+				Name:    "yes",
+				Aliases: []string{"y"},
+				Usage:   "automatically answer 'yes' to all prompts and run non-interactively",
+			},
+			&cli.BoolFlag{
 				Name:  "force",
 				Usage: "skip sanity check and force destroy the volume",
 			},
@@ -110,7 +115,7 @@ func destroy(ctx *cli.Context) error {
 		uri = "redis://" + uri
 	}
 	removePassword(uri)
-	m := meta.NewClient(uri, &meta.Config{Retries: 10, Strict: true})
+	m := meta.NewClient(uri, meta.DefaultConf())
 
 	format, err := m.Load(true)
 	if err != nil {
@@ -125,7 +130,7 @@ func destroy(ctx *cli.Context) error {
 	}
 
 	if !ctx.Bool("force") {
-		m.CleanStaleSessions()
+		m.CleanStaleSessions(meta.Background())
 		sessions, err := m.ListSessions()
 		if err != nil {
 			logger.Fatalf("list sessions: %s", err)
@@ -138,7 +143,7 @@ func destroy(ctx *cli.Context) error {
 			logger.Fatalf("%d sessions are active, please disconnect them first:\n%s", num, printSessions(ss))
 		}
 		var totalSpace, availSpace, iused, iavail uint64
-		_ = m.StatFS(meta.Background, &totalSpace, &availSpace, &iused, &iavail)
+		_ = m.StatFS(meta.Background(), meta.RootInode, &totalSpace, &availSpace, &iused, &iavail)
 
 		fmt.Printf(" volume name: %s\n", format.Name)
 		fmt.Printf(" volume UUID: %s\n", format.UUID)
@@ -148,16 +153,16 @@ func destroy(ctx *cli.Context) error {
 		warn("The target volume will be permanently destroyed, including:")
 		warn("1. ALL objects in the data storage: %s", blob)
 		warn("2. ALL entries in the metadata engine: %s", utils.RemovePassword(uri))
-		if !userConfirmed() {
+		if !ctx.Bool("yes") && !userConfirmed() {
 			logger.Fatalln("Aborted.")
 		}
 	}
 
-	objs, err := osync.ListAll(blob, "", "")
+	objs, err := osync.ListAll(blob, "", "", "", true)
 	if err != nil {
 		logger.Fatalf("list all objects: %s", err)
 	}
-	progress := utils.NewProgress(false, false)
+	progress := utils.NewProgress(false)
 	spin := progress.AddCountSpinner("Deleted objects")
 	var failed int
 	var dirs []string

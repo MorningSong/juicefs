@@ -1,9 +1,11 @@
 ---
-sidebar_label: 常规测试
+title: 常规测试
 sidebar_position: 1
 slug: .
+description: 本文介绍使用 FIO、mdtest 以及 JuiceFS 自带的 bench 命令对文件系统进行性能测试。
 ---
-# JuiceFS 常规测试
+
+本章介绍的测试中使用 [Redis](https://redis.io) 作为元数据存储引擎。在该测试条件下，JuiceFS 拥有十倍于 Amazon [EFS](https://aws.amazon.com/efs) 和 [S3FS](https://github.com/s3fs-fuse/s3fs-fuse) 的性能表现。
 
 ### 基础测试
 
@@ -29,16 +31,4 @@ JuiceFS 提供了 `bench`  子命令来运行一些基本的基准测试，用�
 
 ### 分析测试结果
 
-假定在 JuiceFS 的根目录下有一个名为 `.accesslog` 的文件，它保存了所有操作对应的时间，例如：
-
-```shell
-cat /jfs/.accesslog
-```
-
-```output
-2021.01.15 08:26:11.003330 [uid:0,gid:0,pid:4403] write (17669,8666,4993160): OK <0.000010>
-2021.01.15 08:26:11.003473 [uid:0,gid:0,pid:4403] write (17675,198,997439): OK <0.000014>
-2021.01.15 08:26:11.003616 [uid:0,gid:0,pid:4403] write (17666,390,951582): OK <0.000006>
-```
-
-每行最后一个数表示当前操作所消耗的时间（单位：秒）。你可以直接参考这些数值来调试和分析性能问题，也可以试试 `./juicefs profile /jfs` 命令来实时监测性能统计数据。你也可以运行 `./juicefs profile -h` 或者参考[这里](../benchmark/operations_profiling.md)了解这个子命令。
+如遇性能问题，阅读[「实时性能监控」](../administration/fault_diagnosis_and_analysis.md#performance-monitor)了解如何排查。

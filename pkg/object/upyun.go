@@ -23,7 +23,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"strings"
@@ -59,10 +58,11 @@ func (u *up) Head(key string) (Object, error) {
 		info.Size,
 		info.Time,
 		strings.HasSuffix(key, "/"),
+		"",
 	}, nil
 }
 
-func (u *up) Get(key string, off, limit int64) (io.ReadCloser, error) {
+func (u *up) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
 	w := bytes.NewBuffer(nil)
 	_, err := u.c.Get(&upyun.GetObjectConfig{
 		Path:   "/" + key,
@@ -75,17 +75,17 @@ func (u *up) Get(key string, off, limit int64) (io.ReadCloser, error) {
 	if limit > 0 && limit < int64(len(data)) {
 		data = data[:limit]
 	}
-	return ioutil.NopCloser(bytes.NewBuffer(data)), nil
+	return io.NopCloser(bytes.NewBuffer(data)), nil
 }
 
-func (u *up) Put(key string, in io.Reader) error {
+func (u *up) Put(key string, in io.Reader, getters ...AttrGetter) error {
 	return u.c.Put(&upyun.PutObjectConfig{
 		Path:   "/" + key,
 		Reader: in,
 	})
 }
 
-func (u *up) Delete(key string) error {
+func (u *up) Delete(key string, getters ...AttrGetter) error {
 	return u.c.Delete(&upyun.DeleteObjectConfig{
 		Path: "/" + key,
 	})
@@ -98,7 +98,10 @@ func (u *up) Copy(dst, src string) error {
 	})
 }
 
-func (u *up) List(prefix, marker string, limit int64) ([]Object, error) {
+func (u *up) List(prefix, marker, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
+	if delimiter != "" {
+		return nil, false, "", notSupported
+	}
 	if u.listing == nil {
 		listing := make(chan *upyun.FileInfo, limit)
 		go func() {
@@ -119,14 +122,13 @@ func (u *up) List(prefix, marker string, limit int64) ([]Object, error) {
 		}
 		key := prefix + "/" + fi.Name
 		if !fi.IsDir && key > marker {
-			objs = append(objs, &obj{key, fi.Size, fi.Time, strings.HasSuffix(key, "/")})
+			objs = append(objs, &obj{key, fi.Size, fi.Time, strings.HasSuffix(key, "/"), ""})
 		}
 	}
-	if len(objs) > 0 {
-		return objs, nil
+	if len(objs) == 0 {
+		u.listing = nil
 	}
-	u.listing = nil
-	return nil, u.err
+	return generateListResult(objs, limit)
 }
 
 func newUpyun(endpoint, user, passwd, token string) (ObjectStorage, error) {
@@ -148,7 +150,9 @@ func newUpyun(endpoint, user, passwd, token string) (ObjectStorage, error) {
 	if strings.Contains(uri.Host, ".") {
 		cfg.Hosts["v0.api.upyun.com"] = strings.SplitN(uri.Host, ".", 2)[1]
 	}
-	return &up{c: upyun.NewUpYun(cfg)}, nil
+	upYun := upyun.NewUpYun(cfg)
+	upYun.SetHTTPClient(httpClient)
+	return &up{c: upYun}, nil
 }
 
 func init() {

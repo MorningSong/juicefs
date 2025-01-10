@@ -25,11 +25,14 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
+	"time"
+
+	"github.com/pkg/errors"
 
 	"github.com/huaweicloud/huaweicloud-sdk-go-obs/obs"
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -39,13 +42,25 @@ import (
 const obsDefaultRegion = "cn-north-1"
 
 type obsClient struct {
-	bucket string
-	region string
-	c      *obs.ObsClient
+	bucket    string
+	region    string
+	checkEtag bool
+	sc        string
+	c         *obs.ObsClient
 }
 
 func (s *obsClient) String() string {
 	return fmt.Sprintf("obs://%s/", s.bucket)
+}
+
+func (s *obsClient) Limits() Limits {
+	return Limits{
+		IsSupportMultipartUpload: true,
+		IsSupportUploadPartCopy:  true,
+		MinPartSize:              100 << 10,
+		MaxPartSize:              5 << 30,
+		MaxPartCount:             10000,
+	}
 }
 
 func (s *obsClient) Create() error {
@@ -53,13 +68,20 @@ func (s *obsClient) Create() error {
 	params.Bucket = s.bucket
 	params.Location = s.region
 	params.AvailableZone = "3az"
+	params.StorageClass = obs.StorageClassType(s.sc)
 	_, err := s.c.CreateBucket(params)
 	if err != nil && isExists(err) {
 		err = nil
 	}
 	return err
 }
-
+func getStorageClassStr(sc obs.StorageClassType) string {
+	if sc == "" {
+		return string(obs.StorageClassStandard)
+	} else {
+		return string(sc)
+	}
+}
 func (s *obsClient) Head(key string) (Object, error) {
 	params := &obs.GetObjectMetadataInput{
 		Bucket: s.bucket,
@@ -72,30 +94,43 @@ func (s *obsClient) Head(key string) (Object, error) {
 		}
 		return nil, err
 	}
+
 	return &obj{
 		key,
 		r.ContentLength,
 		r.LastModified,
 		strings.HasSuffix(key, "/"),
+		getStorageClassStr(r.StorageClass),
 	}, nil
 }
 
-func (s *obsClient) Get(key string, off, limit int64) (io.ReadCloser, error) {
+func (s *obsClient) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
 	params := &obs.GetObjectInput{}
 	params.Bucket = s.bucket
 	params.Key = key
-	params.RangeStart = off
-	if limit > 0 {
-		params.RangeEnd = off + limit - 1
+	var resp *obs.GetObjectOutput
+	var err error
+	rangeStr := getRange(off, limit)
+	if rangeStr != "" {
+		resp, err = s.c.GetObject(params, obs.WithHeader(obs.HEADER_RANGE, []string{rangeStr}))
+	} else {
+		resp, err = s.c.GetObject(params)
 	}
-	resp, err := s.c.GetObject(params)
+	if resp != nil {
+		attrs := applyGetters(getters...)
+		attrs.SetRequestID(resp.RequestId).SetStorageClass(getStorageClassStr(resp.StorageClass))
+	}
 	if err != nil {
+		return nil, err
+	}
+	if err = checkGetStatus(resp.StatusCode, rangeStr != ""); err != nil {
+		_ = resp.Body.Close()
 		return nil, err
 	}
 	return resp.Body, nil
 }
 
-func (s *obsClient) Put(key string, in io.Reader) error {
+func (s *obsClient) Put(key string, in io.Reader, getters ...AttrGetter) error {
 	var body io.ReadSeeker
 	var vlen int64
 	var sum []byte
@@ -115,7 +150,7 @@ func (s *obsClient) Put(key string, in io.Reader) error {
 		sum = h.Sum(nil)
 		body = b
 	} else {
-		data, err := ioutil.ReadAll(in)
+		data, err := io.ReadAll(in)
 		if err != nil {
 			return err
 		}
@@ -132,9 +167,14 @@ func (s *obsClient) Put(key string, in io.Reader) error {
 	params.ContentLength = vlen
 	params.ContentMD5 = base64.StdEncoding.EncodeToString(sum[:])
 	params.ContentType = mimeType
+	params.StorageClass = obs.StorageClassType(s.sc)
 	resp, err := s.c.PutObject(params)
-	if err == nil && strings.Trim(resp.ETag, "\"") != obs.Hex(sum) {
+	if err == nil && s.checkEtag && strings.Trim(resp.ETag, "\"") != obs.Hex(sum) {
 		err = fmt.Errorf("unexpected ETag: %s != %s", strings.Trim(resp.ETag, "\""), obs.Hex(sum))
+	}
+	if resp != nil {
+		attrs := applyGetters(getters...)
+		attrs.SetRequestID(resp.RequestId).SetStorageClass(getStorageClassStr(resp.StorageClass))
 	}
 	return err
 }
@@ -145,39 +185,57 @@ func (s *obsClient) Copy(dst, src string) error {
 	params.Key = dst
 	params.CopySourceBucket = s.bucket
 	params.CopySourceKey = src
+	params.StorageClass = obs.StorageClassType(s.sc)
 	_, err := s.c.CopyObject(params)
 	return err
 }
 
-func (s *obsClient) Delete(key string) error {
+func (s *obsClient) Delete(key string, getters ...AttrGetter) error {
 	params := obs.DeleteObjectInput{}
 	params.Bucket = s.bucket
 	params.Key = key
-	_, err := s.c.DeleteObject(&params)
+	resp, err := s.c.DeleteObject(&params)
+	if resp != nil {
+		attrs := applyGetters(getters...)
+		attrs.SetRequestID(resp.RequestId)
+	}
 	return err
 }
 
-func (s *obsClient) List(prefix, marker string, limit int64) ([]Object, error) {
+func (s *obsClient) List(prefix, start, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
 	input := &obs.ListObjectsInput{
 		Bucket: s.bucket,
-		Marker: marker,
+		Marker: start,
 	}
 	input.Prefix = prefix
 	input.MaxKeys = int(limit)
+	input.Delimiter = delimiter
+	input.EncodingType = "url"
 	resp, err := s.c.ListObjects(input)
 	if err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
 	n := len(resp.Contents)
 	objs := make([]Object, n)
 	for i := 0; i < n; i++ {
+		// Obs SDK listObjects method already decodes the object key.
 		o := resp.Contents[i]
-		objs[i] = &obj{o.Key, o.Size, o.LastModified, strings.HasSuffix(o.Key, "/")}
+		objs[i] = &obj{o.Key, o.Size, o.LastModified, strings.HasSuffix(o.Key, "/"), string(o.StorageClass)}
 	}
-	return objs, nil
+	if delimiter != "" {
+		for _, p := range resp.CommonPrefixes {
+			prefix, err := obs.UrlDecode(p)
+			if err != nil {
+				return nil, false, "", errors.WithMessagef(err, "failed to decode commonPrefixes %s", p)
+			}
+			objs = append(objs, &obj{prefix, 0, time.Unix(0, 0), true, ""})
+		}
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
+	}
+	return objs, resp.IsTruncated, resp.NextMarker, nil
 }
 
-func (s *obsClient) ListAll(prefix, marker string) (<-chan Object, error) {
+func (s *obsClient) ListAll(prefix, marker string, followLink bool) (<-chan Object, error) {
 	return nil, notSupported
 }
 
@@ -185,6 +243,7 @@ func (s *obsClient) CreateMultipartUpload(key string) (*MultipartUpload, error) 
 	params := &obs.InitiateMultipartUploadInput{}
 	params.Bucket = s.bucket
 	params.Key = key
+	params.StorageClass = obs.StorageClassType(s.sc)
 	resp, err := s.c.InitiateMultipartUpload(params)
 	if err != nil {
 		return nil, err
@@ -203,9 +262,26 @@ func (s *obsClient) UploadPart(key string, uploadID string, num int, body []byte
 	sum := md5.Sum(body)
 	params.ContentMD5 = base64.StdEncoding.EncodeToString(sum[:])
 	resp, err := s.c.UploadPart(params)
-	if err == nil && strings.Trim(resp.ETag, "\"") != obs.Hex(sum[:]) {
+	if err == nil && s.checkEtag && strings.Trim(resp.ETag, "\"") != obs.Hex(sum[:]) {
 		err = fmt.Errorf("unexpected ETag: %s != %s", strings.Trim(resp.ETag, "\""), obs.Hex(sum[:]))
 	}
+	if err != nil {
+		return nil, err
+	}
+	return &Part{Num: num, ETag: resp.ETag}, err
+}
+
+func (s *obsClient) UploadPartCopy(key string, uploadID string, num int, srcKey string, off, size int64) (*Part, error) {
+	resp, err := s.c.CopyPart(&obs.CopyPartInput{
+		Bucket:               s.bucket,
+		Key:                  key,
+		UploadId:             uploadID,
+		PartNumber:           num,
+		CopySourceBucket:     s.bucket,
+		CopySourceKey:        srcKey,
+		CopySourceRangeStart: off,
+		CopySourceRangeEnd:   off + size - 1,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -251,6 +327,11 @@ func (s *obsClient) ListUploads(marker string) ([]*PendingPart, string, error) {
 		nextMarker = result.NextKeyMarker
 	}
 	return parts, nextMarker, nil
+}
+
+func (s *obsClient) SetStorageClass(sc string) error {
+	s.sc = sc
+	return nil
 }
 
 func autoOBSEndpoint(bucketName, accessKey, secretKey, token string) (string, error) {
@@ -326,11 +407,19 @@ func newOBS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error)
 	// Empty proxy url string has no effect
 	// there is a bug in the retry of PUT (did not call Seek(0,0) before retry), so disable the retry here
 	c, err := obs.New(accessKey, secretKey, endpoint, obs.WithSecurityToken(token),
-		obs.WithProxyUrl(urlString), obs.WithMaxRetryCount(0))
+		obs.WithProxyUrl(urlString), obs.WithMaxRetryCount(0), obs.WithHttpTransport(httpClient.Transport.(*http.Transport)))
 	if err != nil {
 		return nil, fmt.Errorf("fail to initialize OBS: %q", err)
 	}
-	return &obsClient{bucketName, region, c}, nil
+	var checkEtag bool
+	if _, err = c.GetBucketEncryption(bucketName); err != nil {
+		if obsError, ok := err.(obs.ObsError); ok && obsError.Code == "NoSuchEncryptionConfiguration" {
+			checkEtag = true
+		} else if !ok || obsError.Code != "NoSuchBucket" {
+			logger.Warnf("get bucket encryption: %q", err)
+		}
+	}
+	return &obsClient{bucket: bucketName, region: region, checkEtag: checkEtag, c: c}, nil
 }
 
 func init() {

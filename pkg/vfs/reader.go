@@ -68,6 +68,7 @@ func (m sstate) String() string {
 
 type FileReader interface {
 	Read(ctx meta.Context, off uint64, buf []byte) (int, syscall.Errno)
+	GetLength() uint64
 	Close(ctx meta.Context)
 }
 
@@ -168,12 +169,10 @@ func (s *sliceReader) run() {
 	inode := f.inode
 	f.Unlock()
 
+	var slices []meta.Slice
+	err := f.r.m.Read(meta.Background(), inode, indx, &slices)
 	f.Lock()
 	length := f.length
-	f.Unlock()
-	var slices []meta.Slice
-	err := f.r.m.Read(meta.Background, inode, indx, &slices)
-	f.Lock()
 	if s.state != BUSY || f.err != 0 || f.closing {
 		s.done(0, 0)
 	}
@@ -203,7 +202,7 @@ func (s *sliceReader) run() {
 	p := s.page.Slice(0, int(need))
 	defer p.Release()
 	var n int
-	ctx := context.TODO()
+	ctx := context.WithValue(context.TODO(), meta.CtxKey("inode"), inode) // Output inode in log for debugging
 	n = f.r.Read(ctx, p, slices, (uint32(s.block.off))%meta.ChunkSize)
 
 	f.Lock()
@@ -220,7 +219,7 @@ func (s *sliceReader) run() {
 		s.currentPos = 0 // start again from beginning
 		err = syscall.EIO
 		f.tried++
-		_ = f.r.m.InvalidateChunkCache(meta.Background, inode, indx)
+		_ = f.r.m.InvalidateChunkCache(meta.Background(), inode, indx)
 		if f.tried > f.r.maxRetries {
 			s.done(err, 0)
 		} else {
@@ -268,8 +267,8 @@ func (s *sliceReader) delete() {
 	} else {
 		s.file.last = s.prev
 	}
+	atomic.AddInt64(&readBufferUsed, -int64(cap(s.page.Data)))
 	s.page.Release()
-	atomic.AddInt64(&readBufferUsed, -int64(s.block.len))
 }
 
 type session struct {
@@ -298,6 +297,12 @@ type fileReader struct {
 	r    *dataReader
 }
 
+func (f *fileReader) GetLength() uint64 {
+	f.Lock()
+	defer f.Unlock()
+	return f.length
+}
+
 // protected by f
 func (f *fileReader) newSlice(block *frange) *sliceReader {
 	s := &sliceReader{}
@@ -320,7 +325,7 @@ func (f *fileReader) newSlice(block *frange) *sliceReader {
 	*(f.last) = s
 	f.last = &(s.next)
 	go s.run()
-	atomic.AddInt64(&readBufferUsed, int64(s.block.len))
+	atomic.AddInt64(&readBufferUsed, int64(cap(s.page.Data)))
 	return s
 }
 
@@ -413,7 +418,7 @@ func (f *fileReader) checkReadahead(block *frange) int {
 	seqdata := ses.total
 	readahead := ses.readahead
 	used := uint64(atomic.LoadInt64(&readBufferUsed))
-	if readahead == 0 && (block.off == 0 || seqdata > block.len) { // begin with read-ahead turned on
+	if readahead == 0 && f.r.blockSize <= f.r.readAheadMax && (block.off == 0 || seqdata > block.len) { // begin with read-ahead turned on
 		ses.readahead = f.r.blockSize
 	} else if readahead < f.r.readAheadMax && seqdata >= readahead && f.r.readAheadTotal-used > readahead*4 {
 		ses.readahead *= 2
@@ -454,19 +459,21 @@ func (f *fileReader) need(block *frange) bool {
 func (f *fileReader) cleanupRequests(block *frange) {
 	now := time.Now()
 	var cnt int
-	f.visit(func(s *sliceReader) {
+	f.visit(func(s *sliceReader) bool {
 		if !s.state.valid() ||
 			!block.overlap(s.block) && (s.lastAccess.Add(time.Second*30).Before(now) || !f.need(s.block)) {
 			s.drop()
 		} else if !block.overlap(s.block) {
 			cnt++
 		}
+		return true
 	})
-	f.visit(func(s *sliceReader) {
+	f.visit(func(s *sliceReader) bool {
 		if !block.overlap(s.block) && cnt > f.r.maxRequests {
 			s.drop()
 			cnt--
 		}
+		return cnt > f.r.maxRequests
 	})
 }
 
@@ -479,10 +486,11 @@ func (f *fileReader) releaseIdleBuffer() {
 	if used > int64(f.r.readAheadTotal) {
 		idle /= time.Duration(used / int64(f.r.readAheadTotal))
 	}
-	f.visit(func(s *sliceReader) {
+	f.visit(func(s *sliceReader) bool {
 		if !s.state.valid() || s.lastAccess.Add(idle).Before(now) || !f.need(s.block) {
 			s.drop()
 		}
+		return true
 	})
 }
 
@@ -496,7 +504,7 @@ func (f *fileReader) splitRange(block *frange) []uint64 {
 		}
 		return false
 	}
-	f.visit(func(s *sliceReader) {
+	f.visit(func(s *sliceReader) bool {
 		if s.state.valid() {
 			if block.contain(s.block.off) && !contain(s.block.off) {
 				ranges = append(ranges, s.block.off)
@@ -505,6 +513,7 @@ func (f *fileReader) splitRange(block *frange) []uint64 {
 				ranges = append(ranges, s.block.end())
 			}
 		}
+		return true
 	})
 	sort.Slice(ranges, func(i, j int) bool {
 		return ranges[i] < ranges[j]
@@ -514,7 +523,7 @@ func (f *fileReader) splitRange(block *frange) []uint64 {
 
 // protected by f
 func (f *fileReader) readAhead(block *frange) {
-	f.visit(func(r *sliceReader) {
+	f.visit(func(r *sliceReader) bool {
 		if r.state.valid() && r.block.off <= block.off && r.block.end() > block.off {
 			if r.state == READY && block.len > f.r.blockSize && r.block.off == block.off && r.block.off%f.r.blockSize == 0 {
 				// next block is ready, reduce readahead by a block
@@ -527,6 +536,7 @@ func (f *fileReader) readAhead(block *frange) {
 			}
 			block.off = r.block.end()
 		}
+		return true
 	})
 	if block.len > 0 && block.off < f.length && uint64(atomic.LoadInt64(&readBufferUsed)) < f.r.readAheadTotal {
 		if block.len < f.r.blockSize {
@@ -550,13 +560,15 @@ func (f *fileReader) prepareRequests(ranges []uint64) []*req {
 	for i := 0; i < edges-1; i++ {
 		var added bool
 		b := frange{ranges[i], ranges[i+1] - ranges[i]}
-		f.visit(func(s *sliceReader) {
+		f.visit(func(s *sliceReader) bool {
 			if !added && s.state.valid() && s.block.include(&b) {
 				s.refs++
 				s.lastAccess = time.Now()
 				reqs = append(reqs, &req{frange{ranges[i] - s.block.off, b.len}, s})
 				added = true
+				return false
 			}
+			return true
 		})
 		if !added {
 			for b.len > 0 {
@@ -580,7 +592,7 @@ func (f *fileReader) waitForIO(ctx meta.Context, reqs []*req, buf []byte) (int, 
 		for s.state != READY && uint64(s.currentPos) < s.block.len {
 			if s.cond.WaitWithTimeout(time.Second) {
 				if ctx.Canceled() {
-					logger.Warnf("read %d interrupted after %d", f.inode, time.Since(start))
+					logger.Warnf("read %d interrupted after %s", f.inode, time.Since(start))
 					return 0, syscall.EINTR
 				}
 			}
@@ -650,19 +662,22 @@ func (f *fileReader) Read(ctx meta.Context, offset uint64, buf []byte) (int, sys
 	return f.waitForIO(ctx, reqs, buf)
 }
 
-func (f *fileReader) visit(fn func(s *sliceReader)) {
+func (f *fileReader) visit(fn func(s *sliceReader) bool) {
 	var next *sliceReader
 	for s := f.slices; s != nil; s = next {
 		next = s.next
-		fn(s)
+		if !fn(s) {
+			break
+		}
 	}
 }
 
 func (f *fileReader) Close(ctx meta.Context) {
 	f.Lock()
 	f.closing = true
-	f.visit(func(s *sliceReader) {
+	f.visit(func(s *sliceReader) bool {
 		s.drop()
+		return true
 	})
 	f.release()
 	f.Unlock()
@@ -684,10 +699,10 @@ func NewDataReader(conf *Config, m meta.Meta, store chunk.ChunkStore) DataReader
 	var readAheadTotal = 256 << 20
 	var readAheadMax = conf.Chunk.BlockSize * 8
 	if conf.Chunk.BufferSize > 0 {
-		readAheadTotal = conf.Chunk.BufferSize * 8 / 10 // 80% of total buffer
+		readAheadTotal = int(conf.Chunk.BufferSize / 10 * 8) // 80% of total buffer
 	}
 	if conf.Chunk.Readahead > 0 {
-		readAheadMax = conf.Chunk.Readahead
+		readAheadMax = utils.Min(conf.Chunk.Readahead, readAheadTotal)
 	}
 	r := &dataReader{
 		m:              m,
@@ -701,6 +716,11 @@ func NewDataReader(conf *Config, m meta.Meta, store chunk.ChunkStore) DataReader
 	}
 	go r.checkReadBuffer()
 	return r
+}
+
+func (r *dataReader) readBufferUsed() int64 {
+	used := atomic.LoadInt64(&readBufferUsed)
+	return used
 }
 
 func (r *dataReader) checkReadBuffer() {
@@ -755,10 +775,11 @@ func (r *dataReader) visit(inode Ino, fn func(*fileReader)) {
 func (r *dataReader) Truncate(inode Ino, length uint64) {
 	r.visit(inode, func(f *fileReader) {
 		if length < f.length {
-			f.visit(func(s *sliceReader) {
+			f.visit(func(s *sliceReader) bool {
 				if s.block.off+s.block.len > length {
 					s.invalidate()
 				}
+				return true
 			})
 		}
 		f.length = length
@@ -771,10 +792,11 @@ func (r *dataReader) Invalidate(inode Ino, off, length uint64) {
 		if off+length > f.length {
 			f.length = off + length
 		}
-		f.visit(func(s *sliceReader) {
+		f.visit(func(s *sliceReader) bool {
 			if b.overlap(s.block) {
 				s.invalidate()
 			}
+			return true
 		})
 	})
 }
@@ -796,8 +818,8 @@ func (r *dataReader) readSlice(ctx context.Context, s *meta.Slice, page *chunk.P
 		n, err := reader.ReadAt(ctx, p, off+int(s.Off))
 		p.Release()
 		if n == 0 && err != nil {
-			logger.Warningf("fail to read sliceId %d (off:%d, size:%d, clen: %d): %s",
-				s.Id, off+int(s.Off), len(buf)-read, s.Size, err)
+			logger.Warningf("fail to read sliceId %d (off:%d, size:%d, clen: %d, inode: %d): %s",
+				s.Id, off+int(s.Off), len(buf)-read, s.Size, ctx.Value(meta.CtxKey("inode")), err)
 			return err
 		}
 		read += n

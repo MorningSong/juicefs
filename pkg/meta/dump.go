@@ -18,12 +18,15 @@ package meta
 
 import (
 	"bufio"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
+	"github.com/goccy/go-json"
+	aclAPI "github.com/juicedata/juicefs/pkg/acl"
 	"github.com/juicedata/juicefs/pkg/utils"
 )
 
@@ -55,6 +58,7 @@ type DumpedSustained struct {
 
 type DumpedAttr struct {
 	Inode     Ino    `json:"inode"`
+	Flags     uint8  `json:"flags,omitempty"`
 	Type      string `json:"type"`
 	Mode      uint16 `json:"mode"`
 	Uid       uint32 `json:"uid"`
@@ -68,6 +72,7 @@ type DumpedAttr struct {
 	Nlink     uint32 `json:"nlink"`
 	Length    uint64 `json:"length"`
 	Rdev      uint32 `json:"rdev,omitempty"`
+	full      bool
 }
 
 type DumpedSlice struct {
@@ -89,14 +94,70 @@ type DumpedXattr struct {
 	Value string `json:"value"`
 }
 
+type DumpedQuota struct {
+	MaxSpace   int64 `json:"maxSpace"`
+	MaxInodes  int64 `json:"maxInodes"`
+	UsedSpace  int64 `json:"-"`
+	UsedInodes int64 `json:"-"`
+}
+
+type DumpedACLEntry struct {
+	Id   uint32 `json:"id"`
+	Perm uint16 `json:"perm"`
+}
+
+type DumpedACL struct {
+	Owner  uint16           `json:"owner"`
+	Group  uint16           `json:"group"`
+	Other  uint16           `json:"other"`
+	Mask   uint16           `json:"mask"`
+	Users  []DumpedACLEntry `json:"users"`
+	Groups []DumpedACLEntry `json:"groups"`
+}
+
 type DumpedEntry struct {
-	Name    string                  `json:"-"`
-	Parents []Ino                   `json:"-"`
-	Attr    *DumpedAttr             `json:"attr,omitempty"`
-	Symlink string                  `json:"symlink,omitempty"`
-	Xattrs  []*DumpedXattr          `json:"xattrs,omitempty"`
-	Chunks  []*DumpedChunk          `json:"chunks,omitempty"`
-	Entries map[string]*DumpedEntry `json:"entries,omitempty"`
+	Name       string                  `json:"-"`
+	Parents    []Ino                   `json:"-"`
+	Attr       *DumpedAttr             `json:"attr,omitempty"`
+	Symlink    string                  `json:"symlink,omitempty"`
+	Xattrs     []*DumpedXattr          `json:"xattrs,omitempty"`
+	Chunks     []*DumpedChunk          `json:"chunks,omitempty"`
+	Entries    map[string]*DumpedEntry `json:"entries,omitempty"`
+	AccessACL  *DumpedACL              `json:"posix_acl_access,omitempty"`
+	DefaultACL *DumpedACL              `json:"posix_acl_default,omitempty"`
+}
+
+type wrapEntryPool struct {
+	sync.Pool
+}
+
+func (p *wrapEntryPool) Get() *DumpedEntry {
+	return p.Pool.Get().(*DumpedEntry)
+}
+
+func (p *wrapEntryPool) Put(de *DumpedEntry) {
+	if de == nil {
+		return
+	}
+
+	de.Name = ""
+	de.Xattrs = nil
+	de.Chunks = nil
+	de.Symlink = ""
+	de.AccessACL = nil
+	de.DefaultACL = nil
+	de.Entries = nil
+	p.Pool.Put(de)
+}
+
+var entryPool = wrapEntryPool{
+	Pool: sync.Pool{
+		New: func() interface{} {
+			return &DumpedEntry{
+				Attr: &DumpedAttr{},
+			}
+		},
+	},
 }
 
 var CHARS = []byte("0123456789ABCDEF")
@@ -174,7 +235,7 @@ func (de *DumpedEntry) writeJSON(bw *bufio.Writer, depth int) error {
 	write(fmt.Sprintf("\n%s\"%s\": {", prefix, escape(de.Name)))
 	data, err := json.Marshal(de.Attr)
 	if err != nil {
-		return err
+		panic(err)
 	}
 	write(fmt.Sprintf("\n%s\"attr\": %s", fieldPrefix, data))
 	if len(de.Symlink) > 0 {
@@ -185,13 +246,25 @@ func (de *DumpedEntry) writeJSON(bw *bufio.Writer, depth int) error {
 			dumpedXattr.Value = escape(dumpedXattr.Value)
 		}
 		if data, err = json.Marshal(de.Xattrs); err != nil {
-			return err
+			panic(err)
 		}
 		write(fmt.Sprintf(",\n%s\"xattrs\": %s", fieldPrefix, data))
 	}
+	if de.AccessACL != nil {
+		if data, err = json.Marshal(de.AccessACL); err != nil {
+			return err
+		}
+		write(fmt.Sprintf(",\n%s\"posix_acl_access\": %s", fieldPrefix, data))
+	}
+	if de.DefaultACL != nil {
+		if data, err = json.Marshal(de.DefaultACL); err != nil {
+			return err
+		}
+		write(fmt.Sprintf(",\n%s\"posix_acl_default\": %s", fieldPrefix, data))
+	}
 	if len(de.Chunks) == 1 {
 		if data, err = json.Marshal(de.Chunks); err != nil {
-			return err
+			panic(err)
 		}
 		write(fmt.Sprintf(",\n%s\"chunks\": %s", fieldPrefix, data))
 	} else if len(de.Chunks) > 1 {
@@ -199,7 +272,7 @@ func (de *DumpedEntry) writeJSON(bw *bufio.Writer, depth int) error {
 		write(fmt.Sprintf(",\n%s\"chunks\": [", fieldPrefix))
 		for i, c := range de.Chunks {
 			if data, err = json.Marshal(c); err != nil {
-				return err
+				panic(err)
 			}
 			write(fmt.Sprintf("\n%s%s", chunkPrefix, data))
 			if i != len(de.Chunks)-1 {
@@ -223,7 +296,7 @@ func (de *DumpedEntry) writeJsonWithOutEntry(bw *bufio.Writer, depth int) error 
 	write(fmt.Sprintf("\n%s\"%s\": {", prefix, escape(de.Name)))
 	data, err := json.Marshal(de.Attr)
 	if err != nil {
-		return err
+		panic(err)
 	}
 	write(fmt.Sprintf("\n%s\"attr\": %s", fieldPrefix, data))
 	if len(de.Xattrs) > 0 {
@@ -231,9 +304,21 @@ func (de *DumpedEntry) writeJsonWithOutEntry(bw *bufio.Writer, depth int) error 
 			dumpedXattr.Value = escape(dumpedXattr.Value)
 		}
 		if data, err = json.Marshal(de.Xattrs); err != nil {
-			return err
+			panic(err)
 		}
 		write(fmt.Sprintf(",\n%s\"xattrs\": %s", fieldPrefix, data))
+	}
+	if de.AccessACL != nil {
+		if data, err = json.Marshal(de.AccessACL); err != nil {
+			return err
+		}
+		write(fmt.Sprintf(",\n%s\"posix_acl_access\": %s", fieldPrefix, data))
+	}
+	if de.DefaultACL != nil {
+		if data, err = json.Marshal(de.DefaultACL); err != nil {
+			return err
+		}
+		write(fmt.Sprintf(",\n%s\"posix_acl_default\": %s", fieldPrefix, data))
 	}
 	write(fmt.Sprintf(",\n%s\"entries\": {", fieldPrefix))
 	return nil
@@ -244,8 +329,16 @@ type DumpedMeta struct {
 	Counters  *DumpedCounters
 	Sustained []*DumpedSustained
 	DelFiles  []*DumpedDelFile
-	FSTree    *DumpedEntry `json:",omitempty"`
-	Trash     *DumpedEntry `json:",omitempty"`
+	Quotas    map[Ino]*DumpedQuota `json:",omitempty"`
+	FSTree    *DumpedEntry         `json:",omitempty"`
+	Trash     *DumpedEntry         `json:",omitempty"`
+}
+
+func (dm *DumpedMeta) validate() error {
+	if dm.Counters == nil {
+		return errors.New("invalid dumped meta: missing 'Counters'")
+	}
+	return nil
 }
 
 func (dm *DumpedMeta) writeJsonWithOutTree(w io.Writer) (*bufio.Writer, error) {
@@ -263,8 +356,21 @@ func (dm *DumpedMeta) writeJsonWithOutTree(w io.Writer) (*bufio.Writer, error) {
 	return bw, nil
 }
 
+func (m *baseMeta) loadDumpedQuotas(ctx Context, quotas map[Ino]*DumpedQuota) {
+	// update quota
+	for inode, q := range quotas {
+		if _, err := m.en.doSetQuota(ctx, inode, &Quota{q.MaxSpace, q.MaxInodes, q.UsedSpace, q.UsedInodes, 0, 0}); err != nil {
+			logger.Warnf("reset quota of %d: %s", inode, err)
+			continue
+		}
+	}
+}
+
 func dumpAttr(a *Attr, d *DumpedAttr) {
-	d.Type = typeToString(a.Typ)
+	if a.Typ > 0 {
+		d.Type = typeToString(a.Typ)
+	}
+	d.Flags = a.Flags
 	d.Mode = a.Mode
 	d.Uid = a.Uid
 	d.Gid = a.Gid
@@ -281,11 +387,12 @@ func dumpAttr(a *Attr, d *DumpedAttr) {
 	} else {
 		d.Length = 0
 	}
+	d.full = a.Full
 }
 
 func loadAttr(d *DumpedAttr) *Attr {
 	return &Attr{
-		// Flags:     0,
+		Flags:     d.Flags,
 		Typ:       typeFromString(d.Type),
 		Mode:      d.Mode,
 		Uid:       d.Uid,
@@ -315,7 +422,7 @@ func loadEntries(r io.Reader, load func(*DumpedEntry), addChunk func(*chunkKey))
 		return
 	}
 
-	progress := utils.NewProgress(false, false)
+	progress := utils.NewProgress(false)
 	bar := progress.AddCountBar("Loaded entries", 1) // with root
 	dm = &DumpedMeta{}
 	counters = &DumpedCounters{ // rebuild counters
@@ -344,10 +451,12 @@ func loadEntries(r io.Reader, load func(*DumpedEntry), addChunk func(*chunkKey))
 			err = dec.Decode(&dm.Sustained)
 		case "DelFiles":
 			err = dec.Decode(&dm.DelFiles)
+		case "Quotas":
+			err = dec.Decode(&dm.Quotas)
 		case "FSTree":
-			_, err = decodeEntry(dec, 0, counters, parents, refs, bar, load, addChunk)
+			_, err = decodeEntry(dec, 0, counters, parents, dm.Quotas, refs, bar, load, addChunk)
 		case "Trash":
-			_, err = decodeEntry(dec, 1, counters, parents, refs, bar, load, addChunk)
+			_, err = decodeEntry(dec, 1, counters, parents, nil, refs, bar, load, addChunk)
 		}
 		if err != nil {
 			err = fmt.Errorf("load %v: %s", name, err)
@@ -356,12 +465,17 @@ func loadEntries(r io.Reader, load func(*DumpedEntry), addChunk func(*chunkKey))
 	}
 	_, _ = dec.Token() // }
 	progress.Done()
+
+	if err = dm.validate(); err != nil {
+		return
+	}
+
 	logger.Infof("Dumped counters: %+v", *dm.Counters)
 	logger.Infof("Loaded counters: %+v", *counters)
 	return
 }
 
-func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[Ino][]Ino,
+func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[Ino][]Ino, quotas map[Ino]*DumpedQuota,
 	refs map[chunkKey]int64, bar *utils.Bar, load func(*DumpedEntry), addChunk func(*chunkKey)) (*DumpedEntry, error) {
 	if _, err := dec.Token(); err != nil {
 		return nil, err
@@ -427,6 +541,7 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 		case "entries":
 			e.Entries = make(map[string]*DumpedEntry)
 			_, err = dec.Token()
+			var usedSpace, usedInodes int64
 			if err == nil {
 				for dec.More() {
 					var n json.Token
@@ -435,21 +550,36 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 						break
 					}
 					var child *DumpedEntry
-					child, err = decodeEntry(dec, e.Attr.Inode, cs, parents, refs, bar, load, addChunk)
+					child, err = decodeEntry(dec, e.Attr.Inode, cs, parents, quotas, refs, bar, load, addChunk)
 					if err != nil {
 						break
 					}
-					if typeFromString(child.Attr.Type) == TypeDirectory {
+					if e.Attr.Inode < TrashInode && typeFromString(child.Attr.Type) == TypeDirectory {
 						e.Attr.Nlink++
 					}
 					e.Entries[n.(string)] = &DumpedEntry{
 						Attr: &DumpedAttr{
-							Inode: child.Attr.Inode,
-							Type:  child.Attr.Type,
+							Inode:  child.Attr.Inode,
+							Type:   child.Attr.Type,
+							Length: child.Attr.Length,
 						},
 					}
+					usedSpace += align4K(child.Attr.Length)
+					usedInodes++
 				}
 				if err == nil {
+					i := e.Attr.Inode
+					for {
+						if q := quotas[i]; q != nil {
+							q.UsedSpace += usedSpace
+							q.UsedInodes += usedInodes
+						}
+						if i <= 1 || len(parents[i]) == 0 {
+							break
+						}
+						i = parents[i][0]
+					}
+
 					var t json.Token
 					t, err = dec.Token()
 					if err == nil && t != json.Delim('}') {
@@ -461,6 +591,10 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 			err = dec.Decode(&e.Symlink)
 		case "xattrs":
 			err = dec.Decode(&e.Xattrs)
+		case "posix_acl_access":
+			err = dec.Decode(&e.AccessACL)
+		case "posix_acl_default":
+			err = dec.Decode(&e.DefaultACL)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("decode %v: %s", name, err)
@@ -474,4 +608,56 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 		return nil, err
 	}
 	return &e, nil
+}
+
+func dumpACL(rule *aclAPI.Rule) *DumpedACL {
+	if rule == nil {
+		return nil
+	}
+	return &DumpedACL{
+		Owner:  rule.Owner,
+		Group:  rule.Group,
+		Other:  rule.Other,
+		Mask:   rule.Mask,
+		Users:  dumpACLEntries(rule.NamedUsers),
+		Groups: dumpACLEntries(rule.NamedGroups),
+	}
+}
+
+func dumpACLEntries(entries aclAPI.Entries) []DumpedACLEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	dumpedEnts := make([]DumpedACLEntry, len(entries))
+	for i, ent := range entries {
+		dumpedEnts[i].Id = ent.Id
+		dumpedEnts[i].Perm = ent.Perm
+	}
+	return dumpedEnts
+}
+
+func loadACL(dumped *DumpedACL) *aclAPI.Rule {
+	if dumped == nil {
+		return nil
+	}
+	return &aclAPI.Rule{
+		Owner:       dumped.Owner,
+		Group:       dumped.Group,
+		Mask:        dumped.Mask,
+		Other:       dumped.Other,
+		NamedUsers:  loadACLEntries(dumped.Users),
+		NamedGroups: loadACLEntries(dumped.Groups),
+	}
+}
+
+func loadACLEntries(dumpedEnts []DumpedACLEntry) aclAPI.Entries {
+	if len(dumpedEnts) == 0 {
+		return nil
+	}
+	ents := make(aclAPI.Entries, len(dumpedEnts))
+	for i, d := range dumpedEnts {
+		ents[i].Id = d.Id
+		ents[i].Perm = d.Perm
+	}
+	return ents
 }

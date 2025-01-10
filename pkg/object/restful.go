@@ -18,12 +18,9 @@ package object
 
 import (
 	"bytes"
-	"crypto/hmac"
-	"crypto/sha1"
-	"encoding/base64"
+	"crypto/tls"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
@@ -38,7 +35,6 @@ var resolver = dnscache.New(time.Minute)
 var httpClient *http.Client
 
 func init() {
-	rand.Seed(time.Now().Unix())
 	httpClient = &http.Client{
 		Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
@@ -46,6 +42,8 @@ func init() {
 			ResponseHeaderTimeout: time.Second * 30,
 			IdleConnTimeout:       time.Second * 300,
 			MaxIdleConnsPerHost:   500,
+			ReadBufferSize:        32 << 10,
+			WriteBufferSize:       32 << 10,
 			Dial: func(network string, address string) (net.Conn, error) {
 				separator := strings.LastIndex(address, ":")
 				host := address[:separator]
@@ -75,6 +73,7 @@ func init() {
 				return nil, err
 			},
 			DisableCompression: true,
+			TLSClientConfig:    &tls.Config{},
 		},
 		Timeout: time.Hour,
 	}
@@ -86,7 +85,7 @@ func GetHttpClient() *http.Client {
 
 func cleanup(response *http.Response) {
 	if response != nil && response.Body != nil {
-		_, _ = ioutil.ReadAll(response.Body)
+		_, _ = io.Copy(io.Discard, response.Body)
 		_ = response.Body.Close()
 	}
 }
@@ -105,24 +104,6 @@ func (s *RestfulStorage) String() string {
 }
 
 var HEADER_NAMES = []string{"Content-MD5", "Content-Type", "Date"}
-
-// RequestURL is fully url of api request
-func sign(req *http.Request, accessKey, secretKey, signName string) {
-	if accessKey == "" {
-		return
-	}
-	toSign := req.Method + "\n"
-	for _, n := range HEADER_NAMES {
-		toSign += req.Header.Get(n) + "\n"
-	}
-	bucket := strings.Split(req.URL.Host, ".")[0]
-	toSign += "/" + bucket + req.URL.Path
-	h := hmac.New(sha1.New, []byte(secretKey))
-	_, _ = h.Write([]byte(toSign))
-	sig := base64.StdEncoding.EncodeToString(h.Sum(nil))
-	token := signName + " " + accessKey + ":" + sig
-	req.Header.Add("Authorization", token)
-}
 
 func (s *RestfulStorage) request(method, key string, body io.Reader, headers map[string]string) (*http.Response, error) {
 	uri := s.endpoint + "/" + key
@@ -146,7 +127,7 @@ func (s *RestfulStorage) request(method, key string, body io.Reader, headers map
 }
 
 func parseError(resp *http.Response) error {
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("request failed: %s", err)
 	}
@@ -176,17 +157,36 @@ func (s *RestfulStorage) Head(key string) (Object, error) {
 		resp.ContentLength,
 		mtime,
 		strings.HasSuffix(key, "/"),
+		"",
 	}, nil
 }
 
-func (s *RestfulStorage) Get(key string, off, limit int64) (io.ReadCloser, error) {
-	headers := make(map[string]string)
+func getRange(off, limit int64) string {
 	if off > 0 || limit > 0 {
 		if limit > 0 {
-			headers["Range"] = fmt.Sprintf("bytes=%d-%d", off, off+limit-1)
+			return fmt.Sprintf("bytes=%d-%d", off, off+limit-1)
 		} else {
-			headers["Range"] = fmt.Sprintf("bytes=%d-", off)
+			return fmt.Sprintf("bytes=%d-", off)
 		}
+	}
+	return ""
+}
+
+func checkGetStatus(statusCode int, partial bool) error {
+	var expected = http.StatusOK
+	if partial {
+		expected = http.StatusPartialContent
+	}
+	if statusCode != expected {
+		return fmt.Errorf("expected status code %d, but got %d", expected, statusCode)
+	}
+	return nil
+}
+
+func (s *RestfulStorage) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
+	headers := make(map[string]string)
+	if off > 0 || limit > 0 {
+		headers["Range"] = getRange(off, limit)
 	}
 	resp, err := s.request("GET", key, nil, headers)
 	if err != nil {
@@ -195,10 +195,14 @@ func (s *RestfulStorage) Get(key string, off, limit int64) (io.ReadCloser, error
 	if resp.StatusCode != 200 && resp.StatusCode != 206 {
 		return nil, parseError(resp)
 	}
+	if err = checkGetStatus(resp.StatusCode, len(headers) > 0); err != nil {
+		_ = resp.Body.Close()
+		return nil, err
+	}
 	return resp.Body, nil
 }
 
-func (u *RestfulStorage) Put(key string, body io.Reader) error {
+func (u *RestfulStorage) Put(key string, body io.Reader, getters ...AttrGetter) error {
 	resp, err := u.request("PUT", key, body, nil)
 	if err != nil {
 		return err
@@ -216,14 +220,14 @@ func (s *RestfulStorage) Copy(dst, src string) error {
 		return err
 	}
 	defer in.Close()
-	d, err := ioutil.ReadAll(in)
+	d, err := io.ReadAll(in)
 	if err != nil {
 		return err
 	}
 	return s.Put(dst, bytes.NewReader(d))
 }
 
-func (s *RestfulStorage) Delete(key string) error {
+func (s *RestfulStorage) Delete(key string, getters ...AttrGetter) error {
 	resp, err := s.request("DELETE", key, nil, nil)
 	if err != nil {
 		return err
@@ -235,8 +239,8 @@ func (s *RestfulStorage) Delete(key string) error {
 	return nil
 }
 
-func (s *RestfulStorage) List(prefix, marker string, limit int64) ([]Object, error) {
-	return nil, notSupported
+func (s *RestfulStorage) List(prefix, marker, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
+	return nil, false, "", notSupported
 }
 
 var _ ObjectStorage = &RestfulStorage{}

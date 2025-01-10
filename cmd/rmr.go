@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -39,37 +38,55 @@ This command provides a faster way to remove huge directories in JuiceFS.
 
 Examples:
 $ juicefs rmr /mnt/jfs/foo`,
+		Flags: []cli.Flag{
+			&cli.BoolFlag{
+				Name:  "skip-trash",
+				Usage: "skip trash and delete files directly (requires root)",
+			},
+			&cli.IntFlag{
+				Name:    "threads",
+				Aliases: []string{"p"},
+				Value:   50,
+				Usage:   "number of threads for delete jobs (max 255)",
+			},
+		},
 	}
 }
 
-func openController(mp string) *os.File {
-	st, err := os.Stat(mp)
+func openController(dpath string) (*os.File, error) {
+	st, err := os.Stat(dpath)
 	if err != nil {
-		logger.Fatal(err)
+		return nil, err
 	}
 	if !st.IsDir() {
-		mp = filepath.Dir(mp)
+		dpath = filepath.Dir(dpath)
 	}
-	for ; mp != "/"; mp = filepath.Dir(mp) {
-		f, err := os.OpenFile(filepath.Join(mp, ".control"), os.O_RDWR, 0)
-		if err == nil {
-			return f
-		}
-		if !os.IsNotExist(err) {
-			logger.Fatal(err)
-		}
+	fp, err := os.OpenFile(filepath.Join(dpath, ".jfs.control"), os.O_RDWR, 0)
+	if os.IsNotExist(err) {
+		fp, err = os.OpenFile(filepath.Join(dpath, ".control"), os.O_RDWR, 0)
 	}
-	logger.Fatalf("Path %s is not inside JuiceFS", mp)
-	panic("unreachable")
+	return fp, err
 }
 
 func rmr(ctx *cli.Context) error {
 	setup(ctx, 1)
-	if runtime.GOOS == "windows" {
-		logger.Infof("Windows is not supported")
-		return nil
+	var flag uint8
+	var numThreads int
+
+	numThreads = ctx.Int("threads")
+	if numThreads <= 0 {
+		numThreads = meta.RmrDefaultThreads
 	}
-	progress := utils.NewProgress(false, true)
+	if numThreads > 255 {
+		numThreads = 255
+	}
+	if ctx.Bool("skip-trash") {
+		if os.Getuid() != 0 {
+			logger.Fatalf("Only root can remove files directly")
+		}
+		flag = 1
+	}
+	progress := utils.NewProgress(false)
 	spin := progress.AddCountSpinner("Removing entries")
 	for i := 0; i < ctx.Args().Len(); i++ {
 		path := ctx.Args().Get(i)
@@ -84,22 +101,24 @@ func rmr(ctx *cli.Context) error {
 		if err != nil {
 			return fmt.Errorf("lookup inode for %s: %s", d, err)
 		}
-		f := openController(d)
-		if f == nil {
-			logger.Errorf("%s is not inside JuiceFS", path)
+		f, err := openController(d)
+		if err != nil {
+			logger.Errorf("Open control file for %s: %s", d, err)
 			continue
 		}
-		wb := utils.NewBuffer(8 + 8 + 1 + uint32(len(name)))
+		wb := utils.NewBuffer(8 + 8 + 1 + uint32(len(name)) + 1 + 1)
 		wb.Put32(meta.Rmr)
-		wb.Put32(8 + 1 + uint32(len(name)))
+		wb.Put32(8 + 1 + uint32(len(name)) + 1 + 1)
 		wb.Put64(inode)
 		wb.Put8(uint8(len(name)))
 		wb.Put([]byte(name))
+		wb.Put8(flag)
+		wb.Put8(uint8(numThreads))
 		_, err = f.Write(wb.Bytes())
 		if err != nil {
 			logger.Fatalf("write message: %s", err)
 		}
-		if errno := readProgress(f, func(count, bytes uint64) {
+		if _, errno := readProgress(f, func(count, bytes uint64) {
 			spin.SetCurrent(int64(count))
 		}); errno != 0 {
 			logger.Fatalf("RMR %s: %s", path, errno)

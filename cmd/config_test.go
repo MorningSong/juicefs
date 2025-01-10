@@ -25,6 +25,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/meta"
 )
 
+//mutate_test_job_number: 3
 func getStdout(args []string) ([]byte, error) {
 	tmp, err := os.CreateTemp("/tmp", "jfstest-*")
 	if err != nil {
@@ -43,7 +44,9 @@ func getStdout(args []string) ([]byte, error) {
 
 func TestConfig(t *testing.T) {
 	_ = resetTestMeta()
-	if err := Main([]string{"", "format", testMeta, "--bucket", "/tmp/testBucket", testVolume}); err != nil {
+	bucketPath := "/tmp/testBucket"
+	_ = os.RemoveAll(bucketPath)
+	if err := Main([]string{"", "format", testMeta, "--bucket", bucketPath, testVolume}); err != nil {
 		t.Fatalf("format: %s", err)
 	}
 

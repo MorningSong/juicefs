@@ -1,349 +1,108 @@
 name: "fio-benchmark"
 
 on:
+  push:
+    branches:
+    - main
+    - release**
+    paths:
+    - '**/fio_benchmark.yml'
+    - '**/fio.sh'
+  pull_request:
+    branches:
+    - main
+    - release**
+    paths:
+    - '**/fio_benchmark.yml'
+    - '**/fio.sh'
   schedule:
-    - cron:  '0 0 * * *'
+    - cron:  '0 17 * * *'
   workflow_dispatch:
+    inputs:
+      debug:
+        type: boolean
+        description: "Run the build with tmate debugging enabled"
+        required: false
+        default: false
 
 jobs:
-  big-file-sequential-read:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "big-file-sequential-read:  --rw=read --refill_buffers --bs=256k --size=1G"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
+  fio_benchmark:
+    timeout-minutes: 30
+    runs-on: [ubuntu-20.04]
+    strategy:
+      fail-fast: true
+      matrix:
+        meta: ['redis']
+        fio_job : ['big-file-sequential-read', 'big-file-sequential-write',  'big-file-multi-read-4', 
+          'big-file-multi-write-4', 'big-file-rand-read-256k', 'big-file-random-write-256k', 
+          'small-file-seq-read-256k', 'small-file-seq-write-256k', 'small-file-multi-read-4', 
+          'small-file-multi-write-4'] 
+        # fio_job : ['big-file-sequential-read']
 
-  big-file-sequential-write:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "big-file-sequential-write:  --rw=write --refill_buffers --bs=256k  --size=1G"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
 
-  big-file-multi-read-1:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
+      - name: Set up Go
+        uses: actions/setup-go@v3
         with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "big-file-multi-read-1:  --rw=read --refill_buffers --bs=256k --size=1G --numjobs=1"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
+          go-version: 'oldstable'
+          cache: true
+            
+      - name: Build linux target
+        timeout-minutes: 10
+        run: |
+          make juicefs
 
-  big-file-multi-read-4:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "big-file-multi-read-4:  --rw=read --refill_buffers --bs=256k --size=1G --numjobs=4"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
+      - name: Install tools
+        run: |
+          sudo .github/scripts/apt_install.sh fio
 
-  big-file-multi-read-16:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "big-file-multi-read-16:  --rw=read --refill_buffers --bs=256k --size=1G --numjobs=16"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
+      - name: Start meta and storage
+        run: |
+          chmod +x .github/scripts/start_meta_engine.sh
+          source .github/scripts/start_meta_engine.sh
+          start_meta_engine ${{matrix.meta}} minio
 
-  big-file-multi-write-1:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "big-file-multi-write-1:       --rw=write --refill_buffers --bs=256k --size=1G --numjobs=1"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
+      - name: Fio Benchmark 
+        env:
+          AWS_ACCESS_KEY_ID: ${{secrets.CI_COVERAGE_AWS_AK}}
+          AWS_SECRET_ACCESS_KEY: ${{secrets.CI_COVERAGE_AWS_SK}}
+          AWS_ACCESS_TOKEN: ${{secrets.CI_COVERAGE_AWS_TOKEN}}
+        run: |
+          source .github/scripts/start_meta_engine.sh
+          meta_url=$(get_meta_url ${{matrix.meta}})
+          .github/scripts/fio.sh $meta_url  ${{matrix.fio_job}} 
 
-  big-file-multi-write-4:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "big-file-multi-write-4:       --rw=write --refill_buffers --bs=256k --size=1G --numjobs=4"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
+      - name: log
+        if: always()
+        run: | 
+          if [ -f ~/.juicefs/juicefs.log ]; then
+            tail -300 ~/.juicefs/juicefs.log
+            grep "<FATAL>:" ~/.juicefs/juicefs.log && exit 1 || true
+          fi
 
-  big-file-multi-write-16:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
+  success-all-test:
+    runs-on: ubuntu-latest
+    needs: [fio_benchmark]
+    if: always()
     steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "big-file-multi-write-16:       --rw=write --refill_buffers --bs=256k --size=1G --numjobs=16"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
+      - uses: technote-space/workflow-conclusion-action@v3
+      - uses: actions/checkout@v3
 
-  big-file-rand-read-4k:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "big-file-rand-read-4k:       --rw=randread --refill_buffers --size=1G --filename=randread.bin --bs=4k" 
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
-      - name: Setup upterm session
-        if: ${{ failure() }}
-        uses: lhotari/action-upterm@v1
-        
-  big-file-rand-read-256k:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "big-file-rand-read-256k:       --rw=randread --refill_buffers --size=1G --filename=randread.bin --bs=256k" 
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
-      - name: Setup upterm session
-        if: ${{ failure() }}
-        uses: lhotari/action-upterm@v1
+      - name: Check Failure
+        if: env.WORKFLOW_CONCLUSION == 'failure'
+        run: exit 1
 
-  big-file-random-write-16k:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
+      - name: Send Slack Notification
+        if: failure() && github.event_name != 'workflow_dispatch'
+        uses: juicedata/slack-notify-action@main
         with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "big-file-random-write-16k:    --rw=randwrite --refill_buffers --size=1G --bs=16k"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
+          channel-id: "${{ secrets.SLACK_CHANNEL_ID_FOR_PR_CHECK_NOTIFY }}"
+          slack_bot_token: "${{ secrets.SLACK_BOT_TOKEN }}"
 
-  big-file-random-write-256k:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "big-file-random-write-256k:    --rw=randwrite --refill_buffers --size=1G --bs=256k"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
-
-  small-file-seq-read-4k:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "small-file-seq-read-4k:      --rw=read --file_service_type=sequential --bs=4k --filesize=4k --nrfiles=10000 :--cache-size=0"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
-      - name: Setup upterm session
-        if: ${{ failure() }}
-        uses: lhotari/action-upterm@v1
-
-  small-file-seq-read-256k:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "small-file-seq-read-256k:      --rw=read --file_service_type=sequential --bs=256k --filesize=256k --nrfiles=10000 :--cache-size=0"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
-      - name: Setup upterm session
-        if: ${{ failure() }}
-        uses: lhotari/action-upterm@v1
-        
-  small-file-seq-write-4k:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "small-file-seq-write-4k:     --rw=write --file_service_type=sequential --bs=4k --filesize=4k --nrfiles=10000 :--writeback"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
-
-  small-file-seq-write-256k:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "small-file-seq-write-256k:     --rw=write --file_service_type=sequential --bs=256k --filesize=256k --nrfiles=10000 :--writeback"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
-
-  small-file-multi-read-1:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "small-file-multi-read-1:      --rw=read --file_service_type=sequential --bs=4k --filesize=4k --nrfiles=10000 --numjobs=1"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
-
-  small-file-multi-read-4:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "small-file-multi-read-4:      --rw=read --file_service_type=sequential --bs=4k --filesize=4k --nrfiles=10000 --numjobs=4"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
-
-  small-file-multi-read-16:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "small-file-multi-read-16:      --rw=read --file_service_type=sequential --bs=4k --filesize=4k --nrfiles=10000 --numjobs=16"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
-
-  small-file-multi-write-1:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "small-file-multi-write-1:     --rw=write --file_service_type=sequential --bs=4k --filesize=4k --nrfiles=10000 --numjobs=1"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
-
-  small-file-multi-write-4:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "small-file-multi-write-4:     --rw=write --file_service_type=sequential --bs=4k --filesize=4k --nrfiles=10000 --numjobs=4"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
-
-  small-file-multi-write-16:
-    if: github.repository == 'juicedata/juicefs'
-    runs-on: [ubuntu-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 1
-      - name: Test 
-        uses: ./.github/actions/fio
-        with:
-          fio_job: "small-file-multi-write-16:     --rw=write --file_service_type=sequential --bs=4k --filesize=4k --nrfiles=10000 --numjobs=16"
-          mysql_password: ${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}}
-          PYROSCOPE_AUTH_TOKEN: ${{secrets.PYROSCOPE_AUTH_TOKEN}}
+      - name: Success
+        if: success()
+        run: echo "All Done"

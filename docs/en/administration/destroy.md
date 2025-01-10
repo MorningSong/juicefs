@@ -1,8 +1,7 @@
 ---
-sidebar_label: How to destroy a file system
-position: 7
+title: How to destroy a file system
+sidebar_position: 8
 ---
-# How to destroy a file system
 
 JuiceFS client provides the `destroy` command to completely destroy a file system, which will result in
 
@@ -62,7 +61,7 @@ $ juicefs destroy redis://127.0.0.1:6379/1 eabb96d5-7228-461e-9240-fddbf2b576d8
 data storage: file://jfs/
   used bytes: 18620416
  used inodes: 23
-WARNING: The target volume will be destoried permanently, including:
+WARNING: The target volume will be destroyed permanently, including:
 WARNING: 1. objects in the data storage
 WARNING: 2. entries in the metadata engine
 Proceed anyway? [y/N]: y

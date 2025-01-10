@@ -1,160 +1,135 @@
-name: "sync-test"
+name: "sync"
 
 on:
   push:
     branches:
+      - 'main'
       - 'release-**'
-    paths-ignore:
-      - 'docs/**'
+    paths:
+      - '**.go'
+      - 'Makefile'
+      - '**/sync.yml'
+      - '.github/scripts/sync/**'
+      - '.github/scripts/hypo/sync.py'
+      - '.github/scripts/hypo/sync_test.py'
+      - '.github/actions/upload-coverage/action.yml'
+      - '.github/actions/mount-coverage-dir/action.yml'
+      - '.github/actions/upload-total-coverage/action.yml'
   pull_request:
-    #The branches below must be a subset of the branches above
     branches:
+      - 'main'
       - 'release-**'
-    paths-ignore:
-      - 'docs/**'
+    paths:
+      - '**.go'
+      - 'Makefile'
+      - '**/sync.yml'
+      - '.github/scripts/sync/**'
+      - '.github/scripts/hypo/sync.py'
+      - '.github/scripts/hypo/sync_test.py'
+      - '.github/actions/upload-coverage/action.yml'
+      - '.github/actions/mount-coverage-dir/action.yml'
+      - '.github/actions/upload-total-coverage/action.yml'
+      
   workflow_dispatch:
+    inputs:
+      debug:
+        type: boolean
+        description: "Run the build with tmate debugging enabled"
+        required: false
+        default: false
+  schedule:
+    - cron:  '0 17 * * *'
 
 jobs:
-  compare-with-rsync:
-    runs-on: ubuntu-latest
-    services:
-      redis:
-        # Docker Hub image
-        image: redis
-        # Set health checks to wait until redis has started
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          # Maps port 6379 on service container to the host
-          - 6379:6379
+  sync:
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        type: ['sync', 'sync_fsrand', 'sync_minio', 'sync_cluster', 'sync_exclude']
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           fetch-depth: 1
 
-      - name: Set up Go
-        uses: actions/setup-go@v2
+      - name: mount coverage dir
+        timeout-minutes: 5
+        uses: ./.github/actions/mount-coverage-dir
         with:
-          go-version: '1.18.x'
+          mount_point: cover
+          access_key: ${{ secrets.CI_COVERAGE_AWS_AK }}
+          secret_key: ${{ secrets.CI_COVERAGE_AWS_SK }}
+          token: ${{ secrets.CI_COVERAGE_AWS_TOKEN }}
 
-      - name: Build linux target
-        run: make juicefs
-
-      - name: Checkout source code for test
-        uses: actions/checkout@v2
-        with:
-          repository: juicedata/juicefs
-          path: jfs_source
+      - name: Build 
+        uses: ./.github/actions/build
 
       - name: Test Sync
+        timeout-minutes: 60
         run: |
-          meta_url=redis://127.0.0.1/1
-          mount_point=/tmp/sync-test/
-          ./juicefs format --trash-days 0 $meta_url sync-test
-          ./juicefs mount --no-usage-report $meta_url $mount_point -d
-          ./juicefs sync jfs_source/ $mount_point
-          for source_dir in "$mount_point" "jfs_source/" ; do 
-            while IFS=, read -r jfs_option rsync_option status; do
-              printf '\n%s, %s, %s\n' "$jfs_option" "$rsync_option" "$status"
-              status=$(echo $status| xargs)
-              if [[ -z "$status" || "$status" = "disable" ]]; then 
-                continue
-              fi
-              if [ "$source_dir" = "$mount_point" ]; then 
-                jfs_option="--exclude .stats --exclude .config $jfs_option " 
-                rsync_option="--exclude .stats --exclude .config $rsync_option " 
-              fi
-              test -d rsync_dir/ && rm rsync_dir/ -rf 
-              mkdir rsync_dir
-              set -o noglob
-              rsync -a $source_dir rsync_dir/ $rsync_option
-              test -d jfs_sync_dir/ && rm jfs_sync_dir/ -rf 
-              mkdir jfs_sync_dir/
-              ./juicefs sync $source_dir jfs_sync_dir/ $jfs_option
-              set -u noglob
-              printf ’juicefs sync %s %s %s\n‘ "$source_dir"  "jfs_sync_dir/" "$jfs_option" 
-              printf ’rsync %s %s %s\n‘ "$source_dir" "rsync_dir/"  "$rsync_option" 
-              printf ‘diff between juicefs sync and rsync:\n’
-              diff -ur jfs_sync_dir rsync_dir
-            done < .github/workflows/resources/sync-options.txt
-
-          done
-
-      - name: Log
-        if: ${{ always() }}
-        run: |
-          echo "juicefs log"
-          sudo tail -n 1000 ~/.juicefs/juicefs.log
-          grep "<FATAL>:" ~/.juicefs/juicefs.log && exit 1 || true
-
-      - name: Send Slack Notification
-        if: ${{ failure() }}
-        uses: juicedata/slack-notify-action@main
-        with:
-          channel-id: "${{ secrets.SLACK_CHANNEL_ID_FOR_PR_CHECK_NOTIFY }}"
-          slack_bot_token: "${{ secrets.SLACK_BOT_TOKEN }}"  
+          if [[ "${{matrix.type}}" == 'sync' ]]; then
+            sudo GOCOVERDIR=$(pwd)/cover META=redis .github/scripts/sync/sync.sh 
+          elif [[ "${{matrix.type}}" == 'sync_fsrand' ]]; then
+            sudo GOCOVERDIR=$(pwd)/cover META=redis .github/scripts/sync/sync_fsrand.sh 
+          elif [[ "${{matrix.type}}" == 'sync_minio' ]]; then
+            sudo GOCOVERDIR=$(pwd)/cover META=redis .github/scripts/sync/sync_minio.sh 
+          elif [[ "${{matrix.type}}" == 'sync_cluster' ]]; then
+            types=("ecdsa"  "ed25519"  "rsa")
+            random_type=${types[$RANDOM % ${#types[@]}]}
+            sudo CI=true GOCOVERDIR=$(pwd)/cover META=redis KEY_TYPE=$random_type .github/scripts/sync/sync_cluster.sh
+          elif [[ "${{matrix.type}}" == 'sync_exclude' ]]; then
+            sudo GOCOVERDIR=$(pwd)/cover python3 .github/scripts/hypo/sync_test.py
+            if [ "${{github.event_name}}" == "schedule" ]; then
+              sudo GOCOVERDIR=$(pwd)/cover MAX_EXAMPLE=100 STEP_COUNT=50 PROFILE=ci python3 .github/scripts/hypo/sync.py
+            else
+              sudo GOCOVERDIR=$(pwd)/cover MAX_EXAMPLE=50 STEP_COUNT=30 PROFILE=ci python3 .github/scripts/hypo/sync.py
+            fi
+          else
+            echo "Unknown type: ${{matrix.type}}"
+            exit 1
+          fi
 
       - name: Setup upterm session
-        if: ${{ failure() }}
+        if: failure() && (github.event.inputs.debug == 'true' || github.run_attempt != 1)
+        # if: failure()
+        timeout-minutes: 60
         uses: lhotari/action-upterm@v1
 
-  file-head-test:
+  success-all-test:
     runs-on: ubuntu-latest
+    needs: [sync]
+    if: always()
     steps:
-      - name: Checkout
-        uses: actions/checkout@v2
+      - uses: technote-space/workflow-conclusion-action@v3
+      - uses: actions/checkout@v3
+
+      - name: Check Failure
+        if: env.WORKFLOW_CONCLUSION == 'failure'
+        run: exit 1
+      
+      - name: mount coverage dir
+        timeout-minutes: 5
+        uses: ./.github/actions/mount-coverage-dir
         with:
-          fetch-depth: 1
+          mount_point: cover
+          access_key: ${{ secrets.CI_COVERAGE_AWS_AK }}
+          secret_key: ${{ secrets.CI_COVERAGE_AWS_SK }}
+          token: ${{ secrets.CI_COVERAGE_AWS_TOKEN }}
 
-      - name: Set up Go
-        uses: actions/setup-go@v2
+      - name: upload total coverage report
+        timeout-minutes: 5
+        uses: ./.github/actions/upload-total-coverage
         with:
-          go-version: '1.18.x'
-          
-      - name: Build linux target
-        run: |
-          make juicefs
-          # wget -q https://github.com/juicedata/juicefs/releases/download/v1.0.0-beta3/juicefs-1.0.0-beta3-linux-amd64.tar.gz
-          # tar -zxf juicefs-1.0.0-beta3-linux-amd64.tar.gz
-
-      - name: Checkout source code for test
-        uses: actions/checkout@v2
-        with:
-          repository: juicedata/juicefs
-          path: jfs_source
-
-      - name: Test
-        run: |
-          # issue link: https://github.com/juicedata/juicefs/issues/2125
-          meta_url=sqlite3://test.db
-          mount_point=/tmp/sync-test/
-          ./juicefs format --trash-days 0 $meta_url sync-test
-          ./juicefs mount --no-usage-report $meta_url $mount_point -d
-          mkdir $mount_point/jfs_source/
-          ./juicefs sync jfs_source/ $mount_point/jfs_source/  -u=true --perms=true --check-all=true --bwlimit=81920 --dirs=true --threads=30 --debug  
-          echo "test" > jfs_source/test_file
-          mkdir jfs_source/test_dir
-          ./juicefs sync jfs_source/ $mount_point/jfs_source/  -u=true --perms=true --check-all=true --bwlimit=81920 --dirs=true --threads=30 --debug  
-          diff -ur jfs_source/ $mount_point/jfs_source
-
-      - name: Log
-        if: ${{ always() }}
-        run: |
-          echo "juicefs log"
-          sudo tail -n 1000 ~/.juicefs/juicefs.log
-          grep "<FATAL>:" ~/.juicefs/juicefs.log && exit 1 || true
+          UPLOAD_TOKEN: ${{ secrets.CI_COVERAGE_FILE_UPLOAD_AUTH_TOKEN }}
 
       - name: Send Slack Notification
-        if: ${{ failure() }}
+        if: failure() && github.event_name != 'workflow_dispatch' 
         uses: juicedata/slack-notify-action@main
         with:
           channel-id: "${{ secrets.SLACK_CHANNEL_ID_FOR_PR_CHECK_NOTIFY }}"
-          slack_bot_token: "${{ secrets.SLACK_BOT_TOKEN }}"  
+          slack_bot_token: "${{ secrets.SLACK_BOT_TOKEN }}"
 
-      - name: Setup upterm session
-        if: ${{ failure() }}
-        uses: lhotari/action-upterm@v1
+      - name: Success
+        if: success()
+        run: echo "All Done"

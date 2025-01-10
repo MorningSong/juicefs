@@ -21,14 +21,16 @@ package object
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"io/fs"
 	"math/rand"
 	"os"
 	"os/user"
-	"path/filepath"
+	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,16 +43,21 @@ var supergroup = "supergroup"
 
 type hdfsclient struct {
 	DefaultObjectStorage
-	addr string
-	c    *hdfs.Client
+	addr           string
+	basePath       string
+	c              *hdfs.Client
+	dfsReplication int
+	umask          os.FileMode
+	closeTimeout   time.Duration
+	closeMaxDelay  time.Duration
 }
 
 func (h *hdfsclient) String() string {
-	return fmt.Sprintf("hdfs://%s/", h.addr)
+	return fmt.Sprintf("hdfs://%s%s", h.addr, h.basePath)
 }
 
 func (h *hdfsclient) path(key string) string {
-	return "/" + key
+	return h.basePath + key
 }
 
 func (h *hdfsclient) Head(key string) (Object, error) {
@@ -59,6 +66,10 @@ func (h *hdfsclient) Head(key string) (Object, error) {
 		return nil, err
 	}
 
+	return h.toFile(key, info), nil
+}
+
+func (h *hdfsclient) toFile(key string, info os.FileInfo) *file {
 	hinfo := info.(*hdfs.FileInfo)
 	f := &file{
 		obj{
@@ -66,6 +77,7 @@ func (h *hdfsclient) Head(key string) (Object, error) {
 			info.Size(),
 			info.ModTime(),
 			info.IsDir(),
+			"",
 		},
 		hinfo.Owner(),
 		hinfo.OwnerGroup(),
@@ -85,19 +97,14 @@ func (h *hdfsclient) Head(key string) (Object, error) {
 	}
 	if info.IsDir() {
 		f.size = 0
-		if !strings.HasSuffix(f.key, "/") {
+		if !strings.HasSuffix(f.key, "/") && f.key != "" {
 			f.key += "/"
 		}
 	}
-	return f, nil
+	return f
 }
 
-type withCloser struct {
-	io.Reader
-	io.Closer
-}
-
-func (h *hdfsclient) Get(key string, off, limit int64) (io.ReadCloser, error) {
+func (h *hdfsclient) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
 	f, err := h.c.Open(h.path(key))
 	if err != nil {
 		return nil, err
@@ -105,44 +112,47 @@ func (h *hdfsclient) Get(key string, off, limit int64) (io.ReadCloser, error) {
 
 	finfo := f.Stat()
 	if finfo.IsDir() {
-		return ioutil.NopCloser(bytes.NewBuffer([]byte{})), nil
+		return io.NopCloser(bytes.NewBuffer([]byte{})), nil
 	}
 
-	if off > 0 {
-		if _, err := f.Seek(off, io.SeekStart); err != nil {
-			_ = f.Close()
-			return nil, err
-		}
-	}
 	if limit > 0 {
-		return withCloser{io.LimitReader(f, limit), f}, nil
+		return &SectionReaderCloser{
+			SectionReader: io.NewSectionReader(f, off, limit),
+			Closer:        f,
+		}, nil
 	}
 	return f, nil
 }
 
-const abcException = "org.apache.hadoop.hdfs.protocol.AlreadyBeingCreatedException"
-
-func (h *hdfsclient) Put(key string, in io.Reader) error {
-	path := h.path(key)
-	if strings.HasSuffix(path, dirSuffix) {
-		return h.c.MkdirAll(path, os.FileMode(0755))
+func (h *hdfsclient) Put(key string, in io.Reader, getters ...AttrGetter) (err error) {
+	p := h.path(key)
+	if strings.HasSuffix(p, dirSuffix) {
+		return h.c.MkdirAll(p, 0777&^h.umask)
 	}
-	tmp := filepath.Join(filepath.Dir(path), fmt.Sprintf(".%s.tmp.%d", filepath.Base(path), rand.Int()))
-	f, err := h.c.CreateFile(tmp, 3, 128<<20, 0755)
-	defer func() { _ = h.c.Remove(tmp) }()
+	var tmp string
+	if PutInplace {
+		tmp = p
+	} else {
+		name := path.Base(p)
+		if len(name) > 200 {
+			name = name[:200]
+		}
+		tmp = path.Join(path.Dir(p), fmt.Sprintf(".%s.tmp.%d", name, rand.Int()))
+		defer func() {
+			if err != nil {
+				_ = h.c.Remove(tmp)
+			}
+		}()
+	}
+	f, err := h.c.CreateFile(tmp, h.dfsReplication, 128<<20, 0666&^h.umask)
 	if err != nil {
 		if pe, ok := err.(*os.PathError); ok && pe.Err == os.ErrNotExist {
-			_ = h.c.MkdirAll(filepath.Dir(path), 0755)
-			f, err = h.c.CreateFile(tmp, 3, 128<<20, 0755)
+			_ = h.c.MkdirAll(path.Dir(p), 0777&^h.umask)
+			f, err = h.c.CreateFile(tmp, h.dfsReplication, 128<<20, 0666&^h.umask)
 		}
-		if pe, ok := err.(*os.PathError); ok {
-			if remoteErr, ok := pe.Err.(hdfs.Error); ok && remoteErr.Exception() == abcException {
-				pe.Err = os.ErrExist
-			}
-			if pe.Err == os.ErrExist {
-				_ = h.c.Remove(tmp)
-				f, err = h.c.CreateFile(tmp, 3, 128<<20, 0755)
-			}
+		if pe, ok := err.(*os.PathError); ok && errors.Is(pe.Err, os.ErrExist) {
+			_ = h.c.Remove(tmp)
+			f, err = h.c.CreateFile(tmp, h.dfsReplication, 128<<20, 0666&^h.umask)
 		}
 		if err != nil {
 			return err
@@ -155,11 +165,32 @@ func (h *hdfsclient) Put(key string, in io.Reader) error {
 		_ = f.Close()
 		return err
 	}
-	err = f.Close()
-	if err != nil && !IsErrReplicating(err) {
+	start := time.Now()
+	sleeptime := 400 * time.Millisecond
+	for {
+		err = f.Close()
+		if IsErrReplicating(err) && start.Add(h.closeTimeout).After(time.Now()) {
+			time.Sleep(sleeptime)
+			sleeptime = min(2*sleeptime, h.closeMaxDelay)
+			continue
+		} else {
+			break
+		}
+	}
+	if err != nil {
 		return err
 	}
-	return h.c.Rename(tmp, path)
+	if !PutInplace {
+		err = h.c.Rename(tmp, p)
+	}
+	return err
+}
+
+func min(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func IsErrReplicating(err error) bool {
@@ -167,7 +198,7 @@ func IsErrReplicating(err error) bool {
 	return ok && pe.Err == hdfs.ErrReplicating
 }
 
-func (h *hdfsclient) Delete(key string) error {
+func (h *hdfsclient) Delete(key string, getters ...AttrGetter) error {
 	err := h.c.Remove(h.path(key))
 	if err != nil && os.IsNotExist(err) {
 		err = nil
@@ -175,123 +206,73 @@ func (h *hdfsclient) Delete(key string) error {
 	return err
 }
 
-func (h *hdfsclient) List(prefix, marker string, limit int64) ([]Object, error) {
-	return nil, notSupported
-}
-
-func (h *hdfsclient) walk(path string, walkFn filepath.WalkFunc) error {
-	file, err := h.c.Open(path)
-	var info os.FileInfo
-	if file != nil {
-		info = file.Stat()
+func (h *hdfsclient) List(prefix, marker, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
+	if delimiter != "/" {
+		return nil, false, "", notSupported
 	}
-
-	err = walkFn(path, info, err)
-	if err != nil {
-		if info != nil && info.IsDir() && err == filepath.SkipDir {
-			return nil
+	dir := h.path(prefix)
+	var objs []Object
+	if !strings.HasSuffix(dir, dirSuffix) {
+		dir = path.Dir(dir)
+		if !strings.HasSuffix(dir, dirSuffix) {
+			dir += dirSuffix
 		}
-
-		return err
+	} else if marker == "" {
+		obj, err := h.Head(prefix)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, false, "", nil
+			}
+			return nil, false, "", err
+		}
+		objs = append(objs, obj)
 	}
 
-	if info == nil || !info.IsDir() {
-		return nil
+	file, err := h.c.Open(dir)
+	var entries []os.FileInfo
+	if file != nil {
+		entries, err = file.Readdir(0)
 	}
-
-	infos, err := file.Readdir(0)
 	if err != nil {
-		return walkFn(path, info, err)
+		if os.IsPermission(err) {
+			logger.Warnf("skip %s: %s", dir, err)
+			return nil, false, "", nil
+		}
+		if os.IsNotExist(err) {
+			return nil, false, "", nil
+		}
+		return nil, false, "", err
 	}
 
 	// make sure they are ordered in full path
-	names := make([]string, len(infos))
-	for i, info := range infos {
+	entryMap := make(map[string]fs.FileInfo)
+	names := make([]string, len(entries))
+	for i, info := range entries {
 		if info.IsDir() {
 			names[i] = info.Name() + "/"
 		} else {
 			names[i] = info.Name()
 		}
+		entryMap[names[i]] = info
 	}
 	sort.Strings(names)
 
 	for _, name := range names {
-		name = strings.TrimSuffix(name, "/")
-		err = h.walk(filepath.ToSlash(filepath.Join(path, name)), walkFn)
-		if err != nil {
-			return err
+		p := dir + name
+		if !strings.HasPrefix(p, h.basePath) {
+			continue
+		}
+		key := p[len(h.basePath):]
+		if !strings.HasPrefix(key, prefix) || (marker != "" && key <= marker) {
+			continue
+		}
+		f := h.toFile(key, entryMap[name])
+		objs = append(objs, f)
+		if len(objs) >= int(limit) {
+			break
 		}
 	}
-
-	return nil
-}
-
-func (h *hdfsclient) ListAll(prefix, marker string) (<-chan Object, error) {
-	listed := make(chan Object, 10240)
-	root := h.path(prefix)
-	_, err := h.c.Stat(root)
-	if err != nil && err.(*os.PathError).Err == os.ErrNotExist || !strings.HasSuffix(prefix, "/") {
-		root = filepath.Dir(root)
-	}
-	_, err = h.c.Stat(root)
-	if err != nil && err.(*os.PathError).Err == os.ErrNotExist {
-		close(listed)
-		return listed, nil // return empty list
-	}
-	go func() {
-		_ = h.walk(root, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				if err == io.EOF {
-					err = nil // ignore
-				} else {
-					logger.Errorf("list %s: %s", path, err)
-					listed <- nil
-				}
-				return err
-			}
-			key := path[1:]
-			if !strings.HasPrefix(key, prefix) || key < marker {
-				if info.IsDir() && !strings.HasPrefix(prefix, key) && !strings.HasPrefix(marker, key) {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			hinfo := info.(*hdfs.FileInfo)
-			f := &file{
-				obj{
-					key,
-					info.Size(),
-					info.ModTime(),
-					info.IsDir(),
-				},
-				hinfo.Owner(),
-				hinfo.OwnerGroup(),
-				info.Mode(),
-				false,
-			}
-			if f.owner == superuser {
-				f.owner = "root"
-			}
-			if f.group == supergroup {
-				f.group = "root"
-			}
-			// stickybit from HDFS is different than golang
-			if f.mode&01000 != 0 {
-				f.mode &= ^os.FileMode(01000)
-				f.mode |= os.ModeSticky
-			}
-			if info.IsDir() {
-				f.size = 0
-				if path != root || !strings.HasSuffix(root, "/") {
-					f.key += "/"
-				}
-			}
-			listed <- f
-			return nil
-		})
-		close(listed)
-	}()
-	return listed, nil
+	return generateListResult(objs, limit)
 }
 
 func (h *hdfsclient) Chtimes(key string, mtime time.Time) error {
@@ -318,9 +299,11 @@ func newHDFS(addr, username, sk, token string) (ObjectStorage, error) {
 		return nil, fmt.Errorf("Problem loading configuration: %s", err)
 	}
 
+	rpcAddr, basePath := parseHDFSAddr(addr, conf)
 	options := hdfs.ClientOptionsFromConf(conf)
 	if addr != "" {
-		options.Addresses = strings.Split(addr, ",")
+		options.Addresses = rpcAddr
+		logger.Infof("HDFS Addresses: %s, basePath: %s", rpcAddr, basePath)
 	}
 
 	if options.KerberosClient != nil {
@@ -344,7 +327,7 @@ func newHDFS(addr, username, sk, token string) (ObjectStorage, error) {
 
 	c, err := hdfs.NewClient(options)
 	if err != nil {
-		return nil, fmt.Errorf("new HDFS client %s: %s", addr, err)
+		return nil, fmt.Errorf("new HDFS client %s: %s", rpcAddr, err)
 	}
 	if os.Getenv("HADOOP_SUPER_USER") != "" {
 		superuser = os.Getenv("HADOOP_SUPER_USER")
@@ -353,7 +336,67 @@ func newHDFS(addr, username, sk, token string) (ObjectStorage, error) {
 		supergroup = os.Getenv("HADOOP_SUPER_GROUP")
 	}
 
-	return &hdfsclient{addr: addr, c: c}, nil
+	var replication = 3
+	if v, found := conf["dfs.replication"]; found {
+		if x, err := strconv.Atoi(v); err == nil {
+			replication = x
+		}
+	}
+	var umask uint16 = 022
+	if v, found := conf["fs.permissions.umask-mode"]; found {
+		if x, err := strconv.ParseUint(v, 8, 16); err == nil {
+			umask = uint16(x)
+		}
+	}
+	var closeTimeout = 120 * time.Second
+	if v, found := conf["ipc.client.rpc-timeout.ms"]; found {
+		if x, err := strconv.Atoi(v); err == nil {
+			closeTimeout = time.Duration(x) * time.Millisecond
+		}
+	}
+	var closeMaxDelay = 60 * time.Second
+	if v, found := conf["dfs.client.block.write.locateFollowingBlock.max.delay.ms"]; found {
+		if x, err := strconv.Atoi(v); err == nil {
+			closeMaxDelay = time.Duration(x) * time.Millisecond
+		}
+	}
+
+	return &hdfsclient{
+		addr:           strings.Join(rpcAddr, ","),
+		basePath:       basePath,
+		c:              c,
+		dfsReplication: replication,
+		umask:          os.FileMode(umask),
+		closeTimeout:   closeTimeout,
+		closeMaxDelay:  closeMaxDelay,
+	}, nil
+}
+
+// addr can be hdfs://nameservice e.g. hdfs://example, hdfs://example/user/juicefs
+// convert the nameservice as a comma separated list of host:port by referencing hadoop conf
+func parseHDFSAddr(addr string, conf hadoopconf.HadoopConf) (rpcAddresses []string, basePath string) {
+	addr = strings.TrimPrefix(addr, "hdfs://")
+	sp := strings.SplitN(addr, "/", 2)
+	authority := sp[0]
+
+	// check if it is a nameservice
+	var nns []string
+	confParam := "dfs.namenode.rpc-address." + authority
+	for key, value := range conf {
+		if key == confParam || strings.HasPrefix(key, confParam+".") {
+			nns = append(nns, value)
+		}
+	}
+	if len(nns) > 0 {
+		rpcAddresses = nns
+	} else {
+		rpcAddresses = strings.Split(authority, ",")
+	}
+	basePath = "/"
+	if len(sp) > 1 && len(sp[1]) > 0 {
+		basePath += strings.TrimRight(sp[1], "/") + "/"
+	}
+	return
 }
 
 func init() {

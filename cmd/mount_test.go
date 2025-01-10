@@ -26,14 +26,19 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/version"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/agiledragon/gomonkey/v2"
-	"github.com/go-redis/redis/v8"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/utils"
-	. "github.com/smartystreets/goconvey/convey"
+	"github.com/juicedata/juicefs/pkg/vfs"
+	"github.com/redis/go-redis/v9"
 	"github.com/urfave/cli/v2"
 )
 
@@ -43,44 +48,50 @@ const testVolume = "test"
 
 // gomonkey may encounter the problem of insufficient permissions under mac, please solve it by viewing this link https://github.com/agiledragon/gomonkey/issues/70
 func Test_exposeMetrics(t *testing.T) {
-	Convey("Test_exposeMetrics", t, func() {
-		Convey("Test_exposeMetrics", func() {
-			addr := "redis://127.0.0.1:6379/12"
-			client := meta.NewClient(addr, &meta.Config{})
-			format := meta.Format{
-				Name:      "test",
-				BlockSize: 4096,
-				Capacity:  1 << 30,
-			}
-			_ = client.Init(format, true)
-			var appCtx *cli.Context
-			stringPatches := gomonkey.ApplyMethod(reflect.TypeOf(appCtx), "String", func(_ *cli.Context, arg string) string {
-				switch arg {
-				case "metrics":
-					return "127.0.0.1:9567"
-				case "consul":
-					return "127.0.0.1:8500"
-				default:
-					return ""
-				}
-			})
-			isSetPatches := gomonkey.ApplyMethod(reflect.TypeOf(appCtx), "IsSet", func(_ *cli.Context, _ string) bool {
-				return false
-			})
-			defer stringPatches.Reset()
-			defer isSetPatches.Reset()
-			ResetHttp()
-			registerer, registry := wrapRegister("test", "test")
-			metricsAddr := exposeMetrics(appCtx, client, registerer, registry)
-
-			u := url.URL{Scheme: "http", Host: metricsAddr, Path: "/metrics"}
-			resp, err := http.Get(u.String())
-			So(err, ShouldBeNil)
-			all, err := io.ReadAll(resp.Body)
-			So(err, ShouldBeNil)
-			So(string(all), ShouldNotBeBlank)
-		})
+	addr := "redis://127.0.0.1:6379/12"
+	client := meta.NewClient(addr, nil)
+	format := &meta.Format{
+		Name:      "test",
+		BlockSize: 4096,
+		Capacity:  1 << 30,
+		DirStats:  true,
+	}
+	_ = client.Init(format, true)
+	var appCtx *cli.Context
+	stringPatches := gomonkey.ApplyMethod(reflect.TypeOf(appCtx), "String", func(_ *cli.Context, arg string) string {
+		switch arg {
+		case "metrics":
+			return "127.0.0.1:9567"
+		case "consul":
+			return "127.0.0.1:8500"
+		case "custom-labels":
+			return "key1:value1"
+		default:
+			return ""
+		}
 	})
+	isSetPatches := gomonkey.ApplyMethod(reflect.TypeOf(appCtx), "IsSet", func(_ *cli.Context, arg string) bool {
+		switch arg {
+		case "custom-labels":
+			return true
+		default:
+			return false
+		}
+	})
+	defer stringPatches.Reset()
+	defer isSetPatches.Reset()
+	ResetHttp()
+	registerer, registry := wrapRegister(appCtx, "test", "test")
+	metricsAddr := exposeMetrics(appCtx, registerer, registry)
+	client.InitMetrics(registerer)
+	vfs.InitMetrics(registerer)
+	u := url.URL{Scheme: "http", Host: metricsAddr, Path: "/metrics"}
+	resp, err := http.Get(u.String())
+	require.Nil(t, err)
+	all, err := io.ReadAll(resp.Body)
+	require.Nil(t, err)
+	require.NotEmpty(t, all)
+	require.Contains(t, string(all), `key1="value1"`)
 }
 
 func ResetHttp() {
@@ -94,7 +105,14 @@ func resetTestMeta() *redis.Client { // using Redis
 	return rdb
 }
 
+var mountLock sync.Mutex
+
 func mountTemp(t *testing.T, bucket *string, extraFormatOpts []string, extraMountOpts []string) {
+	// wait for last mount exit
+	for !mountLock.TryLock() {
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	_ = resetTestMeta()
 	testDir := t.TempDir()
 	if bucket != nil {
@@ -111,16 +129,27 @@ func mountTemp(t *testing.T, bucket *string, extraFormatOpts []string, extraMoun
 	// must do reset, otherwise will panic
 	ResetHttp()
 
-	mountArgs := []string{"", "mount", "--enable-xattr", testMeta, testMountPoint, "--no-usage-report"}
+	os.Setenv("JFS_SUPERVISOR", "test")
+	mountArgs := []string{"", "mount", "--enable-xattr", testMeta, testMountPoint, "--attr-cache", "0", "--entry-cache", "0", "--dir-entry-cache", "0", "--no-usage-report"}
 	if extraMountOpts != nil {
 		mountArgs = append(mountArgs, extraMountOpts...)
 	}
 	go func() {
+		defer mountLock.Unlock()
 		if err := Main(mountArgs); err != nil {
 			t.Errorf("mount failed: %s", err)
 		}
 	}()
-	time.Sleep(2 * time.Second)
+	time.Sleep(3 * time.Second)
+	inode, err := utils.GetFileInode(testMountPoint)
+	if err != nil {
+		t.Fatalf("get file inode failed: %s", err)
+	}
+	if inode != 1 {
+		t.Fatalf("mount failed: inode of %s got %d, expect 1", testMountPoint, inode)
+	} else {
+		t.Logf("mount %s success", testMountPoint)
+	}
 }
 
 func umountTemp(t *testing.T) {
@@ -180,4 +209,70 @@ func TestUmount(t *testing.T) {
 	if inode == 1 {
 		t.Fatalf("umount failed: inode of %s is 1", testMountPoint)
 	}
+}
+
+func tryMountTemp(t *testing.T, bucket *string, extraFormatOpts []string, extraMountOpts []string) error {
+	// wait for last mount exit
+	for !mountLock.TryLock() {
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	_ = resetTestMeta()
+	testDir := t.TempDir()
+	if bucket != nil {
+		*bucket = testDir
+	}
+	formatArgs := []string{"", "format", "--bucket", testDir, testMeta, testVolume}
+	if extraFormatOpts != nil {
+		formatArgs = append(formatArgs, extraFormatOpts...)
+	}
+	if err := Main(formatArgs); err != nil {
+		return fmt.Errorf("format failed: %w", err)
+	}
+
+	// must do reset, otherwise will panic
+	ResetHttp()
+
+	mountArgs := []string{"", "mount", "--enable-xattr", testMeta, testMountPoint, "--attr-cache", "0", "--entry-cache", "0", "--dir-entry-cache", "0", "--no-usage-report"}
+	if extraMountOpts != nil {
+		mountArgs = append(mountArgs, extraMountOpts...)
+	}
+
+	os.Setenv("JFS_SUPERVISOR", "test")
+	errChan := make(chan error, 1)
+	go func() {
+		defer mountLock.Unlock()
+		errChan <- Main(mountArgs)
+	}()
+
+	select {
+	case err := <-errChan:
+		if err != nil {
+			return fmt.Errorf("mount failed: %w", err)
+		}
+	case <-time.After(3 * time.Second):
+	}
+
+	inode, err := utils.GetFileInode(testMountPoint)
+	if err != nil {
+		return fmt.Errorf("get file inode failed: %w", err)
+	}
+	if inode != 1 {
+		return fmt.Errorf("mount failed: inode of %s is %d, expect 1", testMountPoint, inode)
+	}
+	t.Logf("mount %s success", testMountPoint)
+	return nil
+}
+
+func TestMountVersionMatch(t *testing.T) {
+	oriVersion := version.Version()
+	version.SetVersion("1.1.0")
+	defer version.SetVersion(oriVersion)
+
+	err := tryMountTemp(t, nil, nil, nil)
+	assert.Nil(t, err)
+	umountTemp(t)
+
+	err = tryMountTemp(t, nil, []string{"--enable-acl=true"}, nil)
+	assert.Contains(t, err.Error(), "check version")
 }

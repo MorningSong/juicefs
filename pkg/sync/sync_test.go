@@ -18,12 +18,13 @@ package sync
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
 )
@@ -44,7 +45,7 @@ func TestIterator(t *testing.T) {
 	m.Put("aa", bytes.NewReader([]byte("a")))
 	m.Put("c", bytes.NewReader([]byte("a")))
 
-	ch, _ := ListAll(m, "a", "b")
+	ch, _ := ListAll(m, "", "a", "b", true)
 	keys := collectAll(ch)
 	if len(keys) != 3 {
 		t.Fatalf("length should be 3, but got %d", len(keys))
@@ -56,7 +57,7 @@ func TestIterator(t *testing.T) {
 	// Single object
 	s, _ := object.CreateStorage("mem", "", "", "", "")
 	s.Put("a", bytes.NewReader([]byte("a")))
-	ch, _ = ListAll(s, "", "")
+	ch, _ = ListAll(s, "", "", "", true)
 	keys = collectAll(ch)
 	if !reflect.DeepEqual(keys, []string{"a"}) {
 		t.Fatalf("result wrong: %s", keys)
@@ -75,7 +76,7 @@ func TestIeratorSingleEmptyKey(t *testing.T) {
 
 	// Simulate command line prefix in SRC or DST
 	s = object.WithPrefix(s, "abc")
-	ch, _ := ListAll(s, "", "")
+	ch, _ := ListAll(s, "", "", "", true)
 	keys := collectAll(ch)
 	if !reflect.DeepEqual(keys, []string{""}) {
 		t.Fatalf("result wrong: %s", keys)
@@ -105,6 +106,7 @@ func TestSync(t *testing.T) {
 		DeleteDst: false,
 		Exclude:   []string{"c*"},
 		Include:   []string{"a[1-9]", "a*"},
+		MaxSize:   math.MaxInt64,
 		Verbose:   false,
 		Quiet:     true,
 	}
@@ -131,24 +133,25 @@ func TestSync(t *testing.T) {
 	if err := Sync(a, b, config); err != nil {
 		t.Fatalf("sync: %s", err)
 	}
-	// No copy occured
+	// No copy occurred
 	if c := copied.Current(); c != 0 {
 		t.Fatalf("should copy 0 keys, but got %d", c)
 	}
 
-	// Now a: {"a1", "a2", "abc","c1","c2"}, b: {"a1", "ba"}
+	// Now a: {"a1", "a2", "abc", "c1", "c2"}, b: {"a1", "a2", "ba"}
 	// Copy "ba" from b to a
 	os.Args = []string{}
 	config.Exclude = nil
+	config.rules = nil
 	if err := Sync(b, a, config); err != nil {
 		t.Fatalf("sync: %s", err)
 	}
 	if c := copied.Current(); c != 1 {
 		t.Fatalf("should copy 1 keys, but got %d", c)
 	}
-	// Now a: {"a1", "a2", "abc","c1","c2","ba"}, b: {"a1", "ba"}
-	aRes, _ := a.ListAll("", "")
-	bRes, _ := b.ListAll("", "")
+	// Now a: {"a1", "a2", "abc", "ba", "c1", "c2"}, b: {"a1", "a2", "ba"}
+	aRes, _ := ListAll(a, "", "", "", true)
+	bRes, _ := ListAll(b, "", "", "", true)
 
 	var aObjs, bObjs []object.Object
 	for obj := range aRes {
@@ -163,7 +166,7 @@ func TestSync(t *testing.T) {
 	}
 
 	if !deepEqualWithOutMtime(aObjs[4], bObjs[len(bObjs)-1]) {
-		t.FailNow()
+		t.Fatalf("expect %+v but got %+v", aObjs[4], bObjs[len(bObjs)-1])
 	}
 	// Test --force-update option
 	config.ForceUpdate = true
@@ -191,6 +194,7 @@ func TestSyncIncludeAndExclude(t *testing.T) {
 		Verbose:   false,
 		Limit:     -1,
 		Quiet:     true,
+		MaxSize:   math.MaxInt64,
 		Exclude:   []string{"1"},
 	}
 	a, _ := object.CreateStorage("file", "/tmp/a/", "", "", "")
@@ -248,7 +252,7 @@ func TestSyncIncludeAndExclude(t *testing.T) {
 			t.Fatalf("sync: %s", err)
 		}
 
-		bRes, _ := b.ListAll("", "")
+		bRes, _ := ListAll(b, "", "", "", true)
 		var bKeys []string
 		for obj := range bRes {
 			bKeys = append(bKeys, obj.Key())
@@ -270,11 +274,11 @@ func TestParseRules(t *testing.T) {
 		},
 		{
 			args:      []string{"--exclude", "a", "--include", "b"},
-			wantRules: []rule{{pattern: "a", include: false}, {pattern: "b", include: true}},
+			wantRules: []rule{{pattern: "a"}, {pattern: "b", include: true}},
 		},
 		{
 			args:      []string{"--include", "a", "--test", "t", "--exclude", "b"},
-			wantRules: []rule{{pattern: "a", include: true}, {pattern: "b", include: false}},
+			wantRules: []rule{{pattern: "a", include: true}, {pattern: "b"}},
 		},
 		{
 			args:      []string{"--include", "a", "--test", "t", "--exclude"},
@@ -282,19 +286,19 @@ func TestParseRules(t *testing.T) {
 		},
 		{
 			args:      []string{"--include", "a", "--exclude", "b", "--include", "c", "--exclude", "d"},
-			wantRules: []rule{{pattern: "a", include: true}, {pattern: "b", include: false}, {pattern: "c", include: true}, {pattern: "d", include: false}},
+			wantRules: []rule{{pattern: "a", include: true}, {pattern: "b"}, {pattern: "c", include: true}, {pattern: "d"}},
 		},
 		{
 			args:      []string{"--include", "a", "--include", "b", "--test", "--exclude", "c", "--exclude", "d"},
-			wantRules: []rule{{pattern: "a", include: true}, {pattern: "b", include: true}, {pattern: "c", include: false}, {pattern: "d", include: false}},
+			wantRules: []rule{{pattern: "a", include: true}, {pattern: "b", include: true}, {pattern: "c"}, {pattern: "d"}},
 		},
 		{
 			args:      []string{"--include=a", "--include=b", "--exclude=c", "--exclude=d", "--test=aaa"},
-			wantRules: []rule{{pattern: "a", include: true}, {pattern: "b", include: true}, {pattern: "c", include: false}, {pattern: "d", include: false}},
+			wantRules: []rule{{pattern: "a", include: true}, {pattern: "b", include: true}, {pattern: "c"}, {pattern: "d"}},
 		},
 		{
 			args:      []string{"-include=a", "--test", "t", "--include=b", "--exclude=c", "-exclude="},
-			wantRules: []rule{{pattern: "a", include: true}, {pattern: "b", include: true}, {pattern: "c", include: false}},
+			wantRules: []rule{{pattern: "a", include: true}, {pattern: "b", include: true}, {pattern: "c"}},
 		},
 	}
 	for _, tt := range tests {
@@ -329,6 +333,7 @@ func TestSyncLink(t *testing.T) {
 		Quiet:       true,
 		Limit:       -1,
 		ForceUpdate: true,
+		MaxSize:     math.MaxInt64,
 	}); err != nil {
 		t.Fatalf("sync: %s", err)
 	}
@@ -341,7 +346,7 @@ func TestSyncLink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get content failed: %s", err)
 	}
-	if c, err := ioutil.ReadAll(content); err != nil || string(c) != "test" {
+	if c, err := io.ReadAll(content); err != nil || string(c) != "test" {
 		t.Fatalf("read content failed: err %s content %s", err, string(c))
 	}
 
@@ -353,7 +358,7 @@ func TestSyncLink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("content failed: %s", err)
 	}
-	if c, err := ioutil.ReadAll(content); err != nil || string(c) != "test" {
+	if c, err := io.ReadAll(content); err != nil || string(c) != "test" {
 		t.Fatalf("read content failed: err %s content %s", err, string(c))
 	}
 
@@ -384,6 +389,7 @@ func TestSyncLinkWithOutFollow(t *testing.T) {
 		Quiet:       true,
 		ForceUpdate: true,
 		Limit:       -1,
+		MaxSize:     math.MaxInt64,
 	}); err != nil {
 		t.Fatalf("sync: %s", err)
 	}
@@ -391,7 +397,7 @@ func TestSyncLinkWithOutFollow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get content error: %s", err)
 	}
-	if c, err := ioutil.ReadAll(content); err != nil || string(c) != "test" {
+	if c, err := io.ReadAll(content); err != nil || string(c) != "test" {
 		t.Fatalf("read content error: %s", err)
 	}
 
@@ -418,6 +424,7 @@ func TestSingleLink(t *testing.T) {
 		Links:       true,
 		Quiet:       true,
 		Limit:       -1,
+		MaxSize:     math.MaxInt64,
 		ForceUpdate: true,
 	}); err != nil {
 		t.Fatalf("sync: %s", err)
@@ -430,6 +437,85 @@ func TestSingleLink(t *testing.T) {
 
 	if readlink != readlink2 || readlink != "/tmp/aa" {
 		t.Fatalf("sync link failed")
+	}
+}
+
+func TestSyncCheckAllLink(t *testing.T) {
+	defer func() {
+		_ = os.RemoveAll("/tmp/a")
+		_ = os.RemoveAll("/tmp/b")
+	}()
+
+	a, _ := object.CreateStorage("file", "/tmp/a/", "", "", "")
+	a.Put("a1", bytes.NewReader([]byte("test")))
+	as := a.(object.SupportSymlink)
+	as.Symlink("/tmp/a/a1", "l1")
+
+	b, _ := object.CreateStorage("file", "/tmp/b/", "", "", "")
+	bs := b.(object.SupportSymlink)
+	bs.Symlink("/tmp/b/a1", "l1")
+
+	if err := Sync(a, b, &Config{
+		Threads:  50,
+		Perms:    true,
+		Links:    true,
+		Quiet:    true,
+		Limit:    -1,
+		MaxSize:  math.MaxInt64,
+		CheckAll: true,
+	}); err != nil {
+		t.Fatalf("sync: %s", err)
+	}
+
+	l1, err := bs.Readlink("l1")
+	if err != nil || l1 != "/tmp/a/a1" {
+		t.Fatalf("readlink: %s content: %s", err, l1)
+	}
+	content, err := b.Get("l1", 0, -1)
+	if err != nil {
+		t.Fatalf("get content failed: %s", err)
+	}
+	if c, err := io.ReadAll(content); err != nil || string(c) != "test" {
+		t.Fatalf("read content failed: err %s content %s", err, string(c))
+	}
+}
+
+func TestSyncCheckNewLink(t *testing.T) {
+	defer func() {
+		_ = os.RemoveAll("/tmp/a")
+		_ = os.RemoveAll("/tmp/b")
+	}()
+
+	a, _ := object.CreateStorage("file", "/tmp/a/", "", "", "")
+	a.Put("a1", bytes.NewReader([]byte("test")))
+	as := a.(object.SupportSymlink)
+	as.Symlink("/tmp/a/a1", "l1")
+
+	b, _ := object.CreateStorage("file", "/tmp/b/", "", "", "")
+	bs := b.(object.SupportSymlink)
+
+	if err := Sync(a, b, &Config{
+		Threads:  50,
+		Perms:    true,
+		Links:    true,
+		Quiet:    true,
+		Limit:    -1,
+		MaxSize:  math.MaxInt64,
+		CheckNew: true,
+	}); err != nil {
+		t.Fatalf("sync: %s", err)
+	}
+
+	l1, err := bs.Readlink("l1")
+	if err != nil || l1 != "/tmp/a/a1" {
+		t.Fatalf("readlink: %s content: %s", err, l1)
+	}
+	content, err := b.Get("l1", 0, -1)
+	if err != nil {
+		t.Fatalf("get content failed: %s", err)
+	}
+	if c, err := io.ReadAll(content); err != nil || string(c) != "test" {
+		t.Fatalf("read content failed: err %s content %s", err, string(c))
 	}
 }
 
@@ -468,6 +554,7 @@ func TestLimits(t *testing.T) {
 		Threads: 50,
 		Update:  true,
 		Perms:   true,
+		MaxSize: math.MaxInt64,
 	}
 	setConfig := func(config *Config, subC subConfig) {
 		config.Limit = subC.limit
@@ -480,7 +567,7 @@ func TestLimits(t *testing.T) {
 			t.Fatalf("sync: %s", err)
 		}
 
-		all, err := tcase.dst.ListAll("", "")
+		all, err := ListAll(tcase.dst, "", "", "", true)
 		if err != nil {
 			t.Fatalf("list all b: %s", err)
 		}
@@ -511,32 +598,6 @@ func testKeysEqual(objsCh <-chan object.Object, expectedKeys []string) error {
 	return nil
 }
 
-func TestSuffixForPath(t *testing.T) {
-	type tcase struct {
-		pattern string
-		key     string
-		want    string
-	}
-	tests := []tcase{
-		{pattern: "a*", key: "a1", want: "a1"},
-		{pattern: "/a*", key: "a1", want: "a1"},
-		{pattern: "a*/", key: "a1", want: "a1"},
-		{pattern: "a*/b*", key: "a1", want: "a1"},
-		{pattern: "a*", key: "a1/b1", want: "b1"},
-		{pattern: "/a*", key: "a1/b1", want: "a1/b1"},
-		{pattern: "/a*", key: "/a1/b1", want: "/a1/b1"},
-		{pattern: "/a*/b*/c*", key: "/a1/b1", want: "/a1/b1"},
-		{pattern: "/a", key: "a1/b1/c1/d1", want: "a1/b1/c1/d1"},
-		{pattern: "a*/", key: "a1/b1", want: "a1/b1"},
-		{pattern: "a*/b*", key: "a1/b1", want: "a1/b1"},
-		{pattern: "a*/b*", key: "a1/b1/c1/d1", want: "c1/d1"},
-	}
-	for _, tt := range tests {
-		if got := suffixForPattern(tt.key, tt.pattern); !reflect.DeepEqual(got, tt.want) {
-			t.Errorf("suffixForPattern(%s, %s) = %v, want %v", tt.key, tt.pattern, got, tt.want)
-		}
-	}
-}
 func TestMatchObjects(t *testing.T) {
 	type tcase struct {
 		rules []rule
@@ -544,30 +605,173 @@ func TestMatchObjects(t *testing.T) {
 		want  bool
 	}
 	tests := []tcase{
-		{rules: []rule{{pattern: "a*", include: false}}, key: "a1", want: false},
-		{rules: []rule{{pattern: "a*/b*", include: false}}, key: "a1/b1", want: false},
-		{rules: []rule{{pattern: "/a*", include: false}}, key: "/a1", want: false},
-		{rules: []rule{{pattern: "/a", include: false}}, key: "/a1", want: true},
-		{rules: []rule{{pattern: "/a/b/c", include: false}}, key: "/a1", want: true},
-		{rules: []rule{{pattern: "a*/b?", include: false}}, key: "a1/b1/c2/d1", want: false},
-		{rules: []rule{{pattern: "a*/b?/", include: false}}, key: "a1/", want: true},
-		{rules: []rule{{pattern: "a*/b?/c.txt", include: false}}, key: "a1/b1", want: true},
-		{rules: []rule{{pattern: "a*/b?/", include: false}}, key: "a1/b1/", want: false},
-		{rules: []rule{{pattern: "a*/b?/", include: false}}, key: "a1/b1/c.txt", want: false},
-		{rules: []rule{{pattern: "a*/", include: false}}, key: "a1/b1", want: false},
-		{rules: []rule{{pattern: "a*/b*/", include: false}}, key: "a1/b1/c1/d.txt/", want: false},
-		{rules: []rule{{pattern: "/a*/b*", include: false}}, key: "/a1/b1/c1/d.txt/", want: false},
-		{rules: []rule{{pattern: "a*/b*/c", include: false}}, key: "a1/b1/c1/d.txt/", want: true},
-		{rules: []rule{{pattern: "a", include: false}}, key: "a/b/c/d/", want: false},
-		{rules: []rule{{pattern: "a.go", include: true}, {pattern: "pkg", include: false}}, key: "a/pkg/c/a.go", want: false},
-		{rules: []rule{{pattern: "a", include: false}, {pattern: "pkg", include: true}}, key: "a/pkg/c/a.go", want: false},
-		{rules: []rule{{pattern: "a.go", include: true}, {pattern: "pkg", include: false}}, key: "", want: true},
-		{rules: []rule{{pattern: "a", include: true}, {pattern: "b/", include: false}, {pattern: "c", include: true}}, key: "a/b/c", want: false},
-		{rules: []rule{{pattern: "a/", include: true}, {pattern: "a", include: false}}, key: "a/b", want: true},
+		{rules: []rule{{pattern: "a*"}}, key: "a1"},
+		{rules: []rule{{pattern: "a*/b*"}}, key: "a1/b1"},
+		{rules: []rule{{pattern: "/a*"}}, key: "/a1"},
+		{rules: []rule{{pattern: "/a"}}, key: "/a1", want: true},
+		{rules: []rule{{pattern: "/a/b/c"}}, key: "/a1", want: true},
+		{rules: []rule{{pattern: "a*/b?"}}, key: "a1/b1/c2/d1"},
+		{rules: []rule{{pattern: "a*/b?/"}}, key: "a1/", want: true},
+		{rules: []rule{{pattern: "a*/b?/c.txt"}}, key: "a1/b1", want: true},
+		{rules: []rule{{pattern: "a*/b?/"}}, key: "a1/b1/"},
+		{rules: []rule{{pattern: "a*/b?/"}}, key: "a1/b1/c.txt"},
+		{rules: []rule{{pattern: "a*/"}}, key: "a1/b1"},
+		{rules: []rule{{pattern: "a*/b*/"}}, key: "a1/b1/c1/d.txt/"},
+		{rules: []rule{{pattern: "/a*/b*"}}, key: "/a1/b1/c1/d.txt/"},
+		{rules: []rule{{pattern: "a*/b*/c"}}, key: "a1/b1/c1/d.txt/", want: true},
+		{rules: []rule{{pattern: "a"}}, key: "a/b/c/d/"},
+		{rules: []rule{{pattern: "a.go", include: true}, {pattern: "pkg"}}, key: "a/pkg/c/a.go"},
+		{rules: []rule{{pattern: "a"}, {pattern: "pkg", include: true}}, key: "a/pkg/c/a.go"},
+		{rules: []rule{{pattern: "a.go", include: true}, {pattern: "pkg"}}, key: "", want: true},
+		{rules: []rule{{pattern: "a", include: true}, {pattern: "b/"}, {pattern: "c", include: true}}, key: "a/b/c"},
+		{rules: []rule{{pattern: "a/", include: true}, {pattern: "a"}}, key: "a/b", want: true},
+		{rules: []rule{{pattern: "/***"}}, key: "a"},
+		{rules: []rule{{pattern: "/***"}}, key: "a/b"},
+		{rules: []rule{{pattern: "/a/***"}}, key: "a/"},
+		{rules: []rule{{pattern: "/a/***"}}, key: "a/b"},
+		{rules: []rule{{pattern: "/a/***"}}, key: "a/b/c"},
+		{rules: []rule{{pattern: "/a/***"}}, key: "b/a/", want: true},
+		{rules: []rule{{pattern: "a/***"}}, key: "a/"},
+		{rules: []rule{{pattern: "a/***"}}, key: "a/b"},
+		{rules: []rule{{pattern: "a/***"}}, key: "a/b/c"},
+		{rules: []rule{{pattern: "a/***"}}, key: "d/a/b/c"},
+		{rules: []rule{{pattern: "a/***"}}, key: "a", want: true},
+		{rules: []rule{{pattern: "a/***"}}, key: "ba", want: true},
+		{rules: []rule{{pattern: "a/***"}}, key: "ba/", want: true},
+		{rules: []rule{{pattern: "*/a/***"}}, key: "/a/"},
+		{rules: []rule{{pattern: "*/a/***"}}, key: "b/a/"},
+		{rules: []rule{{pattern: "*/a/***"}}, key: "b/a/c"},
+		{rules: []rule{{pattern: "/*/a/***"}}, key: "/b/a/"},
+		{rules: []rule{{pattern: "/*/a/***"}}, key: "/b/a/c"},
+		{rules: []rule{{pattern: "/*/a/***"}}, key: "c/b/a/", want: true},
+		{rules: []rule{{pattern: "a/**/b"}}, key: "a/c/b"},
+		{rules: []rule{{pattern: "a/**/b"}}, key: "a/c/d/b"},
+		{rules: []rule{{pattern: "a/**/b"}}, key: "a/c/d/e/b"},
+		{rules: []rule{{pattern: "/**/b"}}, key: "a/c/b"},
+		{rules: []rule{{pattern: "/**/b"}}, key: "a/c/d/b/"},
+		{rules: []rule{{pattern: "a**/b"}}, key: "a/c/d/b/"},
+		{rules: []rule{{pattern: "a**/b"}}, key: "a/c/d/ab/", want: true},
+		{rules: []rule{{pattern: "a**b"}}, key: "a/c/d/b/"},
+		{rules: []rule{{pattern: "a**b"}}, key: "b/c/d/b/", want: true},
+		{rules: []rule{{pattern: "a?**"}}, key: "a/a", want: true},
+		{rules: []rule{{pattern: "**a"}}, key: "a"},
+		{rules: []rule{{pattern: "a**"}}, key: "a"},
+		{rules: []rule{{pattern: "a**a"}}, key: "a", want: true},
+		{rules: []rule{{pattern: "aa**a"}}, key: "aa", want: true},
+		{rules: []rule{{pattern: "**/d2/**a"}}, key: "/d2/d3/1a"},
+		{rules: []rule{{pattern: "**/d2/**a"}}, key: "d2/d3/1a"},
+		{rules: []rule{{pattern: "a/**/a"}}, key: "a", want: true},
+		{rules: []rule{{pattern: "a/**/a"}}, key: "a/", want: true},
+		{rules: []rule{{pattern: "**aa**", include: true}, {pattern: "a"}}, key: "aa/a", want: true},
 	}
 	for _, c := range tests {
-		if got := matchKey(c.rules, c.key); got != c.want {
+		if got := matchLeveledPath(c.rules, c.key); got != c.want {
 			t.Errorf("matchKey(%+v, %s) = %v, want %v", c.rules, c.key, got, c.want)
 		}
+	}
+}
+
+func TestMatchFullPatch(t *testing.T) {
+	type tcase struct {
+		rules []rule
+		key   string
+	}
+	matchedCases := []tcase{
+		{rules: []rule{{pattern: "a"}}, key: "b/a"},
+		{rules: []rule{{pattern: "a*"}}, key: "a1"},
+		{rules: []rule{{pattern: "a*/b*"}}, key: "a1/b1"},
+		{rules: []rule{{pattern: "/a*"}}, key: "/a1"},
+		{rules: []rule{{pattern: "a*/b?/"}}, key: "a1/b1/"},
+		{rules: []rule{{pattern: "a/**/b"}}, key: "a/c/b"},
+		{rules: []rule{{pattern: "a/**/b"}}, key: "a/c/d/b"},
+		{rules: []rule{{pattern: "a/**/b"}}, key: "a/c/d/e/b"},
+		{rules: []rule{{pattern: "/**/b"}}, key: "a/c/b"},
+		{rules: []rule{{pattern: "a**/b"}}, key: "a/c/d/b"},
+		{rules: []rule{{pattern: "a**b"}}, key: "a/c/d/b"},
+		{rules: []rule{{pattern: "**a"}}, key: "a"},
+		{rules: []rule{{pattern: "a**"}}, key: "a"},
+		{rules: []rule{{pattern: "**/d2/**a"}}, key: "/d2/d3/1a"},
+		{rules: []rule{{pattern: "**/d2/**a"}}, key: "d2/d3/1a"},
+	}
+	for _, c := range matchedCases {
+		if got := matchFullPath(c.rules, c.key); got != false {
+			t.Errorf("matchKey(%+v, %s) = %v, want %v", c.rules, c.key, got, false)
+		}
+	}
+	unmatchedCases := []tcase{
+		{rules: []rule{{pattern: "/a"}}, key: "/a1"},
+		{rules: []rule{{pattern: "a*/b?"}}, key: "a1/b1/c2/d1"},
+		{rules: []rule{{pattern: "/a/b/c"}}, key: "/a1"},
+		{rules: []rule{{pattern: "a*/b?/"}}, key: "a1/"},
+		{rules: []rule{{pattern: "a*/b?/c.txt"}}, key: "a1/b1"},
+		{rules: []rule{{pattern: "a*/b?/"}}, key: "a1/b1/c.txt"},
+		{rules: []rule{{pattern: "a*/"}}, key: "a1/b1"},
+		{rules: []rule{{pattern: "a*/b*/"}}, key: "a1/b1/c1/d.txt/"},
+		{rules: []rule{{pattern: "/a*/b*"}}, key: "/a1/b1/c1/d.txt/"},
+		{rules: []rule{{pattern: "a"}}, key: "a/b/c/d/"},
+		{rules: []rule{{pattern: "a*/b*/c"}}, key: "a1/b1/c1/d.txt/"},
+		{rules: []rule{{pattern: "a**/b"}}, key: "a/c/d/ab/"},
+		{rules: []rule{{pattern: "a**b"}}, key: "b/c/d/b"},
+		{rules: []rule{{pattern: "/**/b"}}, key: "a/c/d/b/"},
+		{rules: []rule{{pattern: "a?**"}}, key: "a/a"},
+		{rules: []rule{{pattern: "a**a"}}, key: "a"},
+		{rules: []rule{{pattern: "aa**a"}}, key: "aa"},
+		{rules: []rule{{pattern: "a/**/a"}}, key: "a"},
+		{rules: []rule{{pattern: "a/**/a"}}, key: "a/"},
+		{rules: []rule{{pattern: "**aa**", include: true}, {pattern: "a"}}, key: "aa/a"},
+	}
+	for _, c := range unmatchedCases {
+		if got := matchFullPath(c.rules, c.key); got != true {
+			t.Errorf("matchKey(%+v, %s) = %v, want %v", c.rules, c.key, got, true)
+		}
+	}
+}
+
+func TestParseFilterRule(t *testing.T) {
+	type tcase struct {
+		args  []string
+		rules []rule
+	}
+	cases := []tcase{
+		{[]string{"--include", "a"}, []rule{{pattern: "a", include: true}}},
+		{[]string{"--exclude", "a", "--include", "b"}, []rule{{pattern: "a"}, {pattern: "b", include: true}}},
+		{[]string{"--include", "a", "--test", "t", "--exclude", "b"}, []rule{{pattern: "a", include: true}, {pattern: "b"}}},
+		{[]string{"--include=a", "--test", "t", "--exclude"}, []rule{{pattern: "a", include: true}}},
+		{[]string{"--include", "a", "--test", "t", "--exclude"}, []rule{{pattern: "a", include: true}}},
+		{[]string{"-include=", "a", "--test", "t", "--exclude=*"}, []rule{{pattern: "*"}}},
+	}
+
+	for _, c := range cases {
+		if got := parseIncludeRules(c.args); !reflect.DeepEqual(got, c.rules) {
+			t.Errorf("parseIncludeRules(%+v) = %v, want %v", c.args, got, c.rules)
+		}
+	}
+}
+
+type mockObject struct {
+	size  int64
+	mtime time.Time
+}
+
+func (o *mockObject) Key() string          { return "" }
+func (o *mockObject) IsDir() bool          { return false }
+func (o *mockObject) IsSymlink() bool      { return false }
+func (o *mockObject) Size() int64          { return o.size }
+func (o *mockObject) Mtime() time.Time     { return o.mtime }
+func (o *mockObject) StorageClass() string { return "" }
+
+func TestFilterSizeAndAge(t *testing.T) {
+	config := &Config{
+		MaxSize: 100,
+		MinSize: 10,
+		MaxAge:  time.Second * 100,
+		MinAge:  time.Second * 10,
+	}
+	now := time.Now()
+	if !filterKey(&mockObject{10, now.Add(-time.Second * 15)}, now, nil, config) {
+		t.Fatalf("filterKey failed")
+	}
+	if filterKey(&mockObject{200, now.Add(-time.Second * 200)}, now, nil, config) {
+		t.Fatalf("filterKey should fail")
 	}
 }

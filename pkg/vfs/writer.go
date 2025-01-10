@@ -45,6 +45,8 @@ type DataWriter interface {
 	Flush(ctx meta.Context, inode Ino) syscall.Errno
 	GetLength(inode Ino) uint64
 	Truncate(inode Ino, length uint64)
+	UpdateMtime(inode Ino, mtime time.Time)
+	FlushAll() error
 }
 
 type sliceWriter struct {
@@ -106,7 +108,7 @@ func (s *sliceWriter) flushData() {
 	if s.slen == 0 {
 		return
 	}
-	s.prepareID(meta.Background, true)
+	s.prepareID(meta.Background(), true)
 	if s.err != 0 {
 		logger.Infof("flush inode:%d chunk: %s", s.chunk.file.inode, s.err)
 		s.writer.Abort()
@@ -118,7 +120,6 @@ func (s *sliceWriter) flushData() {
 		s.writer.Abort()
 		s.err = syscall.EIO
 	}
-	s.writer = nil
 }
 
 // protected by s.chunk.file
@@ -143,8 +144,6 @@ func (s *sliceWriter) write(ctx meta.Context, off uint32, data []uint8) syscall.
 				logger.Warnf("write: chunk: %d off: %d %s", s.id, off, err)
 				return syscall.EIO
 			}
-		} else if int(off) <= f.w.blockSize {
-			go s.prepareID(ctx, false)
 		}
 	}
 	return 0
@@ -198,13 +197,17 @@ func (c *chunkWriter) commitThread() {
 
 		if err == 0 {
 			var ss = meta.Slice{Id: s.id, Size: s.length, Off: s.soff, Len: s.slen}
-			err = f.w.m.Write(meta.Background, f.inode, c.indx, s.off, ss)
+			err = f.w.m.Write(meta.Background(), f.inode, c.indx, s.off, ss, s.lastMod)
 			f.w.reader.Invalidate(f.inode, uint64(c.indx)*meta.ChunkSize+uint64(s.off), uint64(ss.Len))
 		}
 
 		f.Lock()
 		if err != 0 {
-			if err != syscall.ENOENT && err != syscall.ENOSPC {
+			if err == syscall.ENOENT {
+				go func(id uint64, length int) {
+					_ = f.w.store.Remove(id, length)
+				}(s.id, int(s.length))
+			} else if err != syscall.ENOSPC && err != syscall.EDQUOT {
 				logger.Warnf("write inode:%d error: %s", f.inode, err)
 				err = syscall.EIO
 			}
@@ -262,6 +265,7 @@ func (f *fileWriter) writeChunk(ctx meta.Context, indx uint32, off uint32, data 
 			notify:  utils.NewCond(&f.Mutex),
 			started: time.Now(),
 		}
+		go s.prepareID(meta.Background(), false)
 		c.slices = append(c.slices, s)
 		if len(c.slices) == 1 {
 			f.w.Lock()
@@ -336,6 +340,16 @@ func (f *fileWriter) Write(ctx meta.Context, off uint64, data []byte) syscall.Er
 	return f.err
 }
 
+func (f *fileWriter) updateMtime(t time.Time) {
+	f.Lock()
+	defer f.Unlock()
+	for _, c := range f.chunks {
+		for _, s := range c.slices {
+			s.lastMod = t
+		}
+	}
+}
+
 func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 	s := time.Now()
 	f.Lock()
@@ -357,7 +371,7 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 				}
 			}
 		}
-		if f.flushcond.WaitWithTimeout(time.Second*3) && ctx.Canceled() {
+		if f.flushcond.WaitWithTimeout(time.Second*3) && ctx.Canceled() && time.Since(s) > f.w.conf.Chunk.PutTimeout*2 {
 			logger.Warnf("flush %d interrupted after %d", f.inode, time.Since(s))
 			err = syscall.EINTR
 			break
@@ -412,6 +426,7 @@ type dataWriter struct {
 	sync.Mutex
 	m          meta.Meta
 	store      chunk.ChunkStore
+	conf       *Config
 	reader     DataReader
 	blockSize  int
 	bufferSize int64
@@ -424,6 +439,7 @@ func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader Dat
 		m:          m,
 		store:      store,
 		reader:     reader,
+		conf:       conf,
 		blockSize:  conf.Chunk.BlockSize,
 		bufferSize: int64(conf.Chunk.BufferSize),
 		files:      make(map[Ino]*fileWriter),
@@ -447,7 +463,7 @@ func (w *dataWriter) flushAll() {
 			for i, c := range f.chunks {
 				hs := len(c.slices) / 2
 				for j, s := range c.slices {
-					if !s.freezed && (now.Sub(s.started) > flushDuration || now.Sub(s.lastMod) > time.Second ||
+					if !s.freezed && (now.Sub(s.started) > flushDuration || now.Sub(s.lastMod) > time.Second && now.Sub(s.started) > time.Second ||
 						tooMany && i%2 == lastBit && j <= hs) {
 						s.freezed = true
 						go s.flushData()
@@ -518,4 +534,30 @@ func (w *dataWriter) Truncate(inode Ino, len uint64) {
 	if f != nil {
 		f.Truncate(len)
 	}
+}
+
+func (w *dataWriter) UpdateMtime(inode Ino, mtime time.Time) {
+	f := w.find(inode)
+	if f != nil {
+		f.updateMtime(mtime)
+	}
+}
+
+func (w *dataWriter) FlushAll() error {
+	var err error
+	w.Lock()
+	for inode, ind := range w.files {
+		ind.refs++
+		w.Unlock()
+		eno := ind.Flush(meta.Background())
+		w.free(ind)
+		if eno != 0 {
+			logger.Errorf("flush %s: %s", inode, eno)
+			return eno
+		}
+		logger.Debugf("Flush %d", inode)
+		w.Lock()
+	}
+	w.Unlock()
+	return err
 }

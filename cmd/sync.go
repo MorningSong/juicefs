@@ -19,16 +19,21 @@ package cmd
 import (
 	"fmt"
 	"net"
-	"net/http"
 	_ "net/http/pprof"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 
+	"github.com/juicedata/juicefs/pkg/metric"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/sync"
+	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/urfave/cli/v2"
 )
 
@@ -41,7 +46,7 @@ func cmdSync() *cli.Command {
 		ArgsUsage: "SRC DST",
 		Description: `
 This tool spawns multiple threads to concurrently syncs objects of two data storages.
-SRC and DST should be [NAME://][ACCESS_KEY:SECRET_KEY@]BUCKET[.ENDPOINT][/PREFIX].
+SRC and DST should be [NAME://][ACCESS_KEY:SECRET_KEY[:TOKEN]@]BUCKET[.ENDPOINT][/PREFIX].
 
 Include/exclude pattern rules:
 The include/exclude rules each specify a pattern that is matched against the names of the files that are going to be transferred.  These patterns can take several forms:
@@ -59,8 +64,7 @@ Examples:
 $ juicefs sync oss://mybucket.oss-cn-shanghai.aliyuncs.com s3://mybucket.s3.us-east-2.amazonaws.com
 
 # Sync objects from S3 to JuiceFS
-$ juicefs mount -d redis://localhost /mnt/jfs
-$ juicefs sync s3://mybucket.s3.us-east-2.amazonaws.com/ /mnt/jfs/
+$ myfs=redis://localhost juicefs sync s3://mybucket.s3.us-east-2.amazonaws.com/ jfs://myfs/ -p 50
 
 # SRC: a1/b1,a2/b2,aaa/b1   DST: empty   sync result: aaa/b1
 $ juicefs sync --exclude='a?/b*' s3://mybucket.s3.us-east-2.amazonaws.com/ /mnt/jfs/
@@ -68,109 +72,198 @@ $ juicefs sync --exclude='a?/b*' s3://mybucket.s3.us-east-2.amazonaws.com/ /mnt/
 # SRC: a1/b1,a2/b2,aaa/b1   DST: empty   sync result: a1/b1,aaa/b1
 $ juicefs sync --include='a1/b1' --exclude='a[1-9]/b*' s3://mybucket.s3.us-east-2.amazonaws.com/ /mnt/jfs/
 
-# SRC: a1/b1,a2/b2,aaa/b1,b1,b2  DST: empty   sync result: a1/b1,b2
+# SRC: a1/b1,a2/b2,aaa/b1,b1,b2  DST: empty   sync result: b2
 $ juicefs sync --include='a1/b1' --exclude='a*' --include='b2' --exclude='b?' s3://mybucket.s3.us-east-2.amazonaws.com/ /mnt/jfs/
 
 Details: https://juicefs.com/docs/community/administration/sync
 Supported storage systems: https://juicefs.com/docs/community/how_to_setup_object_storage#supported-object-storage`,
-		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:    "start",
-				Aliases: []string{"s"},
-				Usage:   "the first `KEY` to sync",
-			},
-			&cli.StringFlag{
-				Name:    "end",
-				Aliases: []string{"e"},
-				Usage:   "the last `KEY` to sync",
-			},
-			&cli.IntFlag{
-				Name:    "threads",
-				Aliases: []string{"p"},
-				Value:   10,
-				Usage:   "number of concurrent threads",
-			},
-			&cli.IntFlag{
-				Name:  "http-port",
-				Value: 6070,
-				Usage: "HTTP `PORT` to listen to",
-			},
-			&cli.BoolFlag{
-				Name:    "update",
-				Aliases: []string{"u"},
-				Usage:   "skip files if the destination is newer",
-			},
-			&cli.BoolFlag{
-				Name:    "force-update",
-				Aliases: []string{"f"},
-				Usage:   "always update existing files",
-			},
-			&cli.BoolFlag{
-				Name:  "perms",
-				Usage: "preserve permissions",
-			},
-			&cli.BoolFlag{
-				Name:  "dirs",
-				Usage: "sync directories or holders",
-			},
-			&cli.BoolFlag{
-				Name:  "dry",
-				Usage: "don't copy file",
-			},
-			&cli.BoolFlag{
-				Name:    "delete-src",
-				Aliases: []string{"deleteSrc"},
-				Usage:   "delete objects from source those already exist in destination",
-			},
-			&cli.BoolFlag{
-				Name:    "delete-dst",
-				Aliases: []string{"deleteDst"},
-				Usage:   "delete extraneous objects from destination",
-			},
-			&cli.StringSliceFlag{
-				Name:  "exclude",
-				Usage: "exclude Key matching PATTERN",
-			},
-			&cli.StringSliceFlag{
-				Name:  "include",
-				Usage: "don't exclude Key matching PATTERN, need to be used with \"--exclude\" option",
-			},
-			&cli.BoolFlag{
-				Name:    "links",
-				Aliases: []string{"l"},
-				Usage:   "copy symlinks as symlinks",
-			},
-			&cli.Int64Flag{
-				Name:  "limit",
-				Usage: "limit the number of objects that will be processed",
-				Value: -1,
-			},
-			&cli.StringFlag{
-				Name:  "manager",
-				Usage: "manager address",
-			},
-			&cli.StringSliceFlag{
-				Name:  "worker",
-				Usage: "hosts (separated by comma) to launch worker",
-			},
-			&cli.IntFlag{
-				Name:  "bwlimit",
-				Usage: "limit bandwidth in Mbps (0 means unlimited)",
-			},
-			&cli.BoolFlag{
-				Name:  "no-https",
-				Usage: "donot use HTTPS",
-			},
-			&cli.BoolFlag{
-				Name:  "check-all",
-				Usage: "verify integrity of all files in source and destination",
-			},
-			&cli.BoolFlag{
-				Name:  "check-new",
-				Usage: "verify integrity of newly copied files",
-			},
-		},
+
+		Flags: expandFlags(
+			selectionFlags(),
+			syncActionFlags(),
+			syncStorageFlags(),
+			clusterFlags(),
+			addCategories("METRICS", []cli.Flag{
+				&cli.StringFlag{
+					Name:  "metrics",
+					Value: "127.0.0.1:9567",
+					Usage: "address to export metrics",
+				},
+				&cli.StringFlag{
+					Name:  "consul",
+					Value: "127.0.0.1:8500",
+					Usage: "consul address to register",
+				},
+			}),
+		),
 	}
+}
+
+func selectionFlags() []cli.Flag {
+	return addCategories("SELECTION", []cli.Flag{
+		&cli.StringFlag{
+			Name:    "start",
+			Aliases: []string{"s"},
+			Usage:   "the first `KEY` to sync",
+		},
+		&cli.StringFlag{
+			Name:    "end",
+			Aliases: []string{"e"},
+			Usage:   "the last `KEY` to sync",
+		},
+		&cli.StringSliceFlag{
+			Name:  "exclude",
+			Usage: "exclude Key matching PATTERN",
+		},
+		&cli.StringSliceFlag{
+			Name:  "include",
+			Usage: "don't exclude Key matching PATTERN, need to be used with \"--exclude\" option",
+		},
+		&cli.BoolFlag{
+			Name:  "match-full-path",
+			Usage: "match filters again the full path",
+		},
+		&cli.StringFlag{
+			Name:  "max-size",
+			Usage: "skip files larger than `SIZE`",
+		},
+		&cli.StringFlag{
+			Name:  "min-size",
+			Usage: "skip files smaller than `SIZE`",
+		},
+		&cli.StringFlag{
+			Name:  "max-age",
+			Usage: "skip files older than `DURATION`",
+		},
+		&cli.StringFlag{
+			Name:  "min-age",
+			Usage: "skip files newer than `DURATION`",
+		},
+		&cli.Int64Flag{
+			Name:  "limit",
+			Usage: "limit the number of objects that will be processed (-1 is unlimited, 0 is to process nothing)",
+			Value: -1,
+		},
+		&cli.BoolFlag{
+			Name:    "update",
+			Aliases: []string{"u"},
+			Usage:   "skip files if the destination is newer",
+		},
+		&cli.BoolFlag{
+			Name:    "force-update",
+			Aliases: []string{"f"},
+			Usage:   "always update existing files",
+		},
+		&cli.BoolFlag{
+			Name:    "existing",
+			Aliases: []string{"ignore-non-existing"},
+			Usage:   "skip creating new files on destination",
+		},
+		&cli.BoolFlag{
+			Name:  "ignore-existing",
+			Usage: "skip updating files that already exist on destination",
+		},
+	})
+}
+
+func syncActionFlags() []cli.Flag {
+	return addCategories("ACTION", []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "dirs",
+			Usage: "sync directories or holders",
+		},
+		&cli.BoolFlag{
+			Name:  "perms",
+			Usage: "preserve permissions",
+		},
+		&cli.BoolFlag{
+			Name:    "links",
+			Aliases: []string{"l"},
+			Usage:   "copy symlinks as symlinks",
+		},
+		&cli.BoolFlag{
+			Name:  "inplace",
+			Usage: "put directly to destination file instead of atomic download to temp/rename",
+		},
+		&cli.BoolFlag{
+			Name:    "delete-src",
+			Aliases: []string{"deleteSrc"},
+			Usage:   "delete objects from source those already exist in destination",
+		},
+		&cli.BoolFlag{
+			Name:    "delete-dst",
+			Aliases: []string{"deleteDst"},
+			Usage:   "delete extraneous objects from destination",
+		},
+		&cli.BoolFlag{
+			Name:  "check-all",
+			Usage: "verify integrity of all files in source and destination",
+		},
+		&cli.BoolFlag{
+			Name:  "check-new",
+			Usage: "verify integrity of newly copied files",
+		},
+		&cli.Int64Flag{
+			Name:  "max-failure",
+			Value: -1,
+			Usage: "max number of allowed failed files (-1 for unlimited)",
+		},
+		&cli.BoolFlag{
+			Name:  "dry",
+			Usage: "don't copy file",
+		},
+	})
+}
+
+func syncStorageFlags() []cli.Flag {
+	return addCategories("STORAGE", []cli.Flag{
+		&cli.IntFlag{
+			Name:    "threads",
+			Aliases: []string{"p"},
+			Value:   10,
+			Usage:   "number of concurrent threads",
+		},
+		&cli.IntFlag{
+			Name:  "list-threads",
+			Value: 1,
+			Usage: "number of threads to list objects",
+		},
+		&cli.IntFlag{
+			Name:  "list-depth",
+			Value: 1,
+			Usage: "list the top N level of directories in parallel",
+		},
+		&cli.BoolFlag{
+			Name:  "no-https",
+			Usage: "donot use HTTPS",
+		},
+		&cli.StringFlag{
+			Name:  "storage-class",
+			Usage: "the storage class for destination",
+		},
+		&cli.StringFlag{
+			Name:  "bwlimit",
+			Usage: "limit bandwidth in Mbps (0 means unlimited)",
+		},
+	})
+}
+
+func clusterFlags() []cli.Flag {
+	return addCategories("CLUSTER", []cli.Flag{
+		&cli.StringFlag{
+			Name:   "manager",
+			Usage:  "the manager address used only by the worker node",
+			Hidden: true,
+		},
+		&cli.StringSliceFlag{
+			Name:  "worker",
+			Usage: "hosts (separated by comma) to launch worker",
+		},
+		&cli.StringFlag{
+			Name:  "manager-addr",
+			Usage: "the IP address to communicate with workers",
+		},
+	})
 }
 
 func supportHTTPS(name, endpoint string) bool {
@@ -203,7 +296,16 @@ func isFilePath(uri string) bool {
 	return !strings.Contains(uri, ":")
 }
 
+func extractToken(uri string) (string, string) {
+	if submatch := regexp.MustCompile(`^.*:.*:.*(:.*)@.*$`).FindStringSubmatch(uri); len(submatch) == 2 {
+		return strings.ReplaceAll(uri, submatch[1], ""), strings.TrimLeft(submatch[1], ":")
+	}
+	return uri, ""
+}
+
 func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, error) {
+	// nolint:staticcheck
+	uri = strings.TrimPrefix(uri, "sftp://")
 	if !strings.Contains(uri, "://") {
 		if isFilePath(uri) {
 			absPath, err := filepath.Abs(uri)
@@ -235,6 +337,7 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 			return object.CreateStorage("sftp", uri, user, pass, "")
 		}
 	}
+	uri, token := extractToken(uri)
 	u, err := url.Parse(uri)
 	if err != nil {
 		logger.Fatalf("Can't parse %s: %s", uri, err.Error())
@@ -246,31 +349,56 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 		secretKey, _ = user.Password()
 	}
 	name := strings.ToLower(u.Scheme)
-	endpoint := u.Host
-	if conf.Links && name != "file" {
-		logger.Warnf("storage %s does not support symlink, ignore it", uri)
-		conf.Links = false
-	}
 
-	isS3PathTypeUrl := isS3PathType(endpoint)
-
+	var endpoint string
 	if name == "file" {
 		endpoint = u.Path
 	} else if name == "hdfs" {
-	} else if !conf.NoHTTPS && supportHTTPS(name, endpoint) {
-		endpoint = "https://" + endpoint
+		endpoint = u.Host
+	} else if name == "jfs" {
+		endpoint, err = url.PathUnescape(u.Host)
+		if err != nil {
+			return nil, fmt.Errorf("unescape %s: %s", u.Host, err)
+		}
+		if os.Getenv(endpoint) != "" {
+			conf.Env[endpoint] = os.Getenv(endpoint)
+		}
+	} else if name == "nfs" {
+		endpoint = u.Host + u.Path
+	} else if !conf.NoHTTPS && supportHTTPS(name, u.Host) {
+		endpoint = "https://" + u.Host
 	} else {
-		endpoint = "http://" + endpoint
+		endpoint = "http://" + u.Host
 	}
+
+	isS3PathTypeUrl := isS3PathType(u.Host)
 	if name == "minio" || name == "s3" && isS3PathTypeUrl {
 		// bucket name is part of path
 		endpoint += u.Path
 	}
 
-	store, err := object.CreateStorage(name, endpoint, accessKey, secretKey, "")
+	store, err := object.CreateStorage(name, endpoint, accessKey, secretKey, token)
+	if name == "nfs" && err != nil {
+		p := u.Path
+		for err != nil && strings.Contains(err.Error(), "MNT3ERR_NOENT") {
+			p = filepath.Dir(p)
+			store, err = object.CreateStorage(name, u.Host+p, accessKey, secretKey, token)
+		}
+		if err == nil {
+			store = object.WithPrefix(store, u.Path[len(p):])
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("create %s %s: %s", name, endpoint, err)
 	}
+
+	if conf.Links {
+		if _, ok := store.(object.SupportSymlink); !ok {
+			logger.Warnf("storage %s does not support symlink, ignore it", uri)
+			conf.Links = false
+		}
+	}
+
 	if conf.Perms {
 		if _, ok := store.(object.FileSystem); !ok {
 			logger.Warnf("%s is not a file system, can not preserve permissions", store)
@@ -278,7 +406,7 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 		}
 	}
 	switch name {
-	case "file":
+	case "file", "nfs":
 	case "minio":
 		if strings.Count(u.Path, "/") > 1 {
 			// skip bucket name
@@ -295,6 +423,7 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 			store = object.WithPrefix(store, u.Path[1:])
 		}
 	}
+
 	return store, nil
 }
 
@@ -310,11 +439,22 @@ func doSync(c *cli.Context) error {
 		logger.Warnf("The include option needs to be used with the exclude option, otherwise the result of the current sync may not match your expectations")
 	}
 	config := sync.NewConfigFromCli(c)
-	go func() { _ = http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", config.HTTPPort), nil) }()
 
+	if config.Manager != "" {
+		logger.Debugf("worker process start")
+	}
 	// Windows support `\` and `/` as its separator, Unix only use `/`
-	srcURL := strings.Replace(c.Args().Get(0), "\\", "/", -1)
-	dstURL := strings.Replace(c.Args().Get(1), "\\", "/", -1)
+	srcURL := c.Args().Get(0)
+	dstURL := c.Args().Get(1)
+	removePassword(srcURL, dstURL)
+	if runtime.GOOS == "windows" {
+		if !strings.Contains(srcURL, "://") {
+			srcURL = strings.Replace(srcURL, "\\", "/", -1)
+		}
+		if !strings.Contains(dstURL, "://") {
+			dstURL = strings.Replace(dstURL, "\\", "/", -1)
+		}
+	}
 	if strings.HasSuffix(srcURL, "/") != strings.HasSuffix(dstURL, "/") {
 		logger.Fatalf("SRC and DST should both end with path separator or not!")
 	}
@@ -325,6 +465,43 @@ func doSync(c *cli.Context) error {
 	dst, err := createSyncStorage(dstURL, config)
 	if err != nil {
 		return err
+	}
+	defer func() {
+		object.Shutdown(src)
+		object.Shutdown(dst)
+	}()
+	if config.StorageClass != "" {
+		if os, ok := dst.(object.SupportStorageClass); ok {
+			err := os.SetStorageClass(config.StorageClass)
+			if err != nil {
+				logger.Errorf("set storage class %s: %s", config.StorageClass, err)
+			}
+		}
+	}
+
+	if config.Manager == "" && !config.Dry {
+		var srcPath, dstPath string
+		if strings.HasPrefix(src.String(), "file://") {
+			srcPath = src.String()
+		}
+		if strings.HasPrefix(dst.String(), "file://") {
+			dstPath = dst.String()
+		}
+		srcPath = utils.RemovePassword(srcPath)
+		dstPath = utils.RemovePassword(dstPath)
+		registry := prometheus.NewRegistry()
+		config.Registerer = prometheus.WrapRegistererWithPrefix("juicefs_sync_",
+			prometheus.WrapRegistererWith(prometheus.Labels{"cmd": "sync", "pid": strconv.Itoa(os.Getpid())}, registry))
+		config.Registerer.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+		config.Registerer.MustRegister(collectors.NewGoCollector())
+		metricsAddr := exposeMetrics(c, config.Registerer, registry)
+		if c.IsSet("consul") {
+			metadata := make(map[string]string)
+			metadata["src"] = srcPath
+			metadata["dst"] = dstPath
+			metadata["pid"] = strconv.Itoa(os.Getpid())
+			metric.RegisterToConsul(c.String("consul"), metricsAddr, metadata)
+		}
 	}
 	return sync.Sync(src, dst, config)
 }

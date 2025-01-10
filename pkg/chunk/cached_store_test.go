@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/stretchr/testify/assert"
 )
 
 func forgetSlice(store ChunkStore, sliceId uint64, size int) error {
@@ -64,6 +65,12 @@ func testStore(t *testing.T, store ChunkStore) {
 	} else if string(p.Data[:n]) != "world" {
 		t.Fatalf("not expected: %s", string(p.Data[:n]))
 	}
+	p = NewPage(make([]byte, 5))
+	if n, err := reader.ReadAt(context.Background(), p, 0); n != 5 || err != nil {
+		t.Fatalf("read failed: %d %s", n, err)
+	} else if string(p.Data[:n]) != "hello" {
+		t.Fatalf("not expected: %s", string(p.Data[:n]))
+	}
 	p = NewPage(make([]byte, 20))
 	if n, err := reader.ReadAt(context.Background(), p, offset); n != 11 || err != nil && err != io.EOF {
 		t.Fatalf("read failed: %d %s", n, err)
@@ -91,16 +98,18 @@ func testStore(t *testing.T, store ChunkStore) {
 }
 
 var defaultConf = Config{
-	BlockSize:  1 << 20,
-	CacheDir:   filepath.Join(os.TempDir(), "diskCache"),
-	CacheSize:  1,
-	MaxUpload:  1,
-	MaxDeletes: 1,
-	MaxRetries: 10,
-	PutTimeout: time.Second,
-	GetTimeout: time.Second * 2,
-	AutoCreate: true,
-	BufferSize: 10 << 20,
+	BlockSize:         1 << 20,
+	CacheDir:          filepath.Join(os.TempDir(), "diskCache"),
+	CacheMode:         0600,
+	CacheSize:         10 << 20,
+	CacheChecksum:     CsNone,
+	CacheScanInterval: time.Second * 300,
+	MaxUpload:         1,
+	MaxRetries:        10,
+	PutTimeout:        time.Second,
+	GetTimeout:        time.Second * 2,
+	AutoCreate:        true,
+	BufferSize:        10 << 20,
 }
 
 func TestStoreDefault(t *testing.T) {
@@ -141,8 +150,8 @@ func TestStoreCompressed(t *testing.T) {
 func TestStoreLimited(t *testing.T) {
 	mem, _ := object.CreateStorage("mem", "", "", "", "")
 	conf := defaultConf
-	conf.UploadLimit = 1 << 20
-	conf.DownloadLimit = 1 << 20
+	conf.UploadLimit = 1e6
+	conf.DownloadLimit = 1e6
 	store := NewCachedStore(mem, conf, nil)
 	testStore(t, store)
 }
@@ -214,7 +223,8 @@ func TestStoreMultiBuckets(t *testing.T) {
 func TestFillCache(t *testing.T) {
 	mem, _ := object.CreateStorage("mem", "", "", "", "")
 	conf := defaultConf
-	conf.CacheSize = 10
+	conf.CacheSize = 10 << 20
+	conf.FreeSpace = 0.01
 	_ = os.RemoveAll(conf.CacheDir)
 	store := NewCachedStore(mem, conf, nil)
 	if err := forgetSlice(store, 10, 1024); err != nil {
@@ -243,6 +253,29 @@ func TestFillCache(t *testing.T) {
 	if cnt, used := bcache.stats(); cnt != 2 || used != expect {
 		t.Fatalf("cache cnt %d used %d, expect cnt 2 used %d", cnt, used, expect)
 	}
+
+	// check
+	missBytes, err := store.CheckCache(10, 1024)
+	assert.Nil(t, err)
+	assert.Equal(t, uint64(0), missBytes)
+
+	missBytes, err = store.CheckCache(11, uint32(bsize))
+	assert.Nil(t, err)
+	assert.Equal(t, uint64(0), missBytes)
+
+	// evict slice 11
+	err = store.EvictCache(11, uint32(bsize))
+	assert.Nil(t, err)
+
+	// stat
+	if cnt, used := bcache.stats(); cnt != 1 || used != 1024+4096 { // only chunk 10 cached
+		t.Fatalf("cache cnt %d used %d, expect cnt 1 used 5120", cnt, used)
+	}
+
+	// check again
+	missBytes, err = store.CheckCache(11, uint32(bsize))
+	assert.Nil(t, err)
+	assert.Equal(t, uint64(bsize), missBytes)
 }
 
 func BenchmarkCachedRead(b *testing.B) {

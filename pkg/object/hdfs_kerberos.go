@@ -7,7 +7,9 @@
 package object
 
 import (
+	"encoding/base64"
 	"fmt"
+	"github.com/jcmturner/gokrb5/v8/keytab"
 	"os"
 	"os/user"
 	"strings"
@@ -26,6 +28,40 @@ func getKerberosClient() (*krb.Client, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return nil, err
+	}
+
+	// Try to authenticate with keytab file first.
+	keytabPath := os.Getenv("KRB5KEYTAB")
+	keytabBase64 := os.Getenv("KRB5KEYTAB_BASE64")
+	principal := os.Getenv("KRB5PRINCIPAL")
+
+	var kt *keytab.Keytab
+	if keytabBase64 != "" {
+		decodedKeytab, err := base64.StdEncoding.DecodeString(keytabBase64)
+		if err != nil {
+			return nil, fmt.Errorf("error decoding Base64 encoded data %s", err)
+		}
+		kt = new(keytab.Keytab)
+		err = kt.Unmarshal(decodedKeytab)
+		if err != nil {
+			return nil, err
+		}
+	} else if keytabPath != "" {
+		kt, err = keytab.Load(keytabPath)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if kt != nil {
+		// e.g. KRB5PRINCIPAL="primary/instance@realm"
+		sp := strings.Split(principal, "@")
+		if len(sp) != 2 {
+			return nil, fmt.Errorf("unusable kerberos principal: %s", principal)
+		}
+		username, realm := sp[0], sp[1]
+		logger.Infof("username: %s, realm: %s", username, realm)
+		client := krb.NewWithKeytab(username, realm, kt, cfg)
+		return client, nil
 	}
 
 	// Determine the ccache location from the environment, falling back to the

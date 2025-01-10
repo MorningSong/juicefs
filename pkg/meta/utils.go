@@ -17,26 +17,30 @@
 package meta
 
 import (
-	"bytes"
 	"fmt"
 	"net/url"
+	"path"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
+	aclCounter     = "aclMaxId"
 	usedSpace      = "usedSpace"
 	totalInodes    = "totalInodes"
 	legacySessions = "sessions"
 )
+
+var counterNames = []string{usedSpace, totalInodes, "nextInode", "nextChunk", "nextSession", "nextTrash"}
 
 const (
 	// fallocate
@@ -46,6 +50,23 @@ const (
 	fallocCollapesRange = 0x08
 	fallocZeroRange     = 0x10
 	fallocInsertRange   = 0x20
+)
+const (
+	// clone mode
+	CLONE_MODE_CAN_OVERWRITE      = 0x01
+	CLONE_MODE_PRESERVE_ATTR      = 0x02
+	CLONE_MODE_PRESERVE_HARDLINKS = 0x08
+
+	// atime mode
+	NoAtime     = "noatime"
+	RelAtime    = "relatime"
+	StrictAtime = "strictatime"
+)
+
+const (
+	MODE_MASK_R = 0b100
+	MODE_MASK_W = 0b010
+	MODE_MASK_X = 0b001
 )
 
 type msgCallbacks struct {
@@ -128,38 +149,42 @@ func align4K(length uint64) int64 {
 	return int64((((length - 1) >> 12) + 1) << 12)
 }
 
-func lookupSubdir(m Meta, subdir string) (Ino, error) {
-	var root Ino = 1
-	for subdir != "" {
-		ps := strings.SplitN(subdir, "/", 2)
-		if ps[0] != "" {
-			var attr Attr
-			var inode Ino
-			r := m.Lookup(Background, root, ps[0], &inode, &attr)
-			if r == syscall.ENOENT {
-				r = m.Mkdir(Background, root, ps[0], 0777, 0, 0, &inode, &attr)
-			}
-			if r != 0 {
-				return 0, fmt.Errorf("lookup subdir %s: %s", ps[0], r)
-			}
-			if attr.Typ != TypeDirectory {
-				return 0, fmt.Errorf("%s is not a redirectory", ps[0])
-			}
-			root = inode
-		}
-		if len(ps) == 1 {
-			break
-		}
-		subdir = ps[1]
-	}
-	return root, nil
+type plockRecord struct {
+	Type  uint32
+	Pid   uint32
+	Start uint64
+	End   uint64
 }
 
-type plockRecord struct {
-	ltype uint32
-	pid   uint32
-	start uint64
-	end   uint64
+type ownerKey struct {
+	Sid   uint64
+	Owner uint64
+}
+
+type PLockItem struct {
+	ownerKey
+	plockRecord
+}
+
+type FLockItem struct {
+	ownerKey
+	Type string
+}
+
+func parseOwnerKey(key string) (*ownerKey, error) {
+	pair := strings.Split(key, "_")
+	if len(pair) != 2 {
+		return nil, fmt.Errorf("invalid owner key: %s", key)
+	}
+	sid, err := strconv.ParseUint(pair[0], 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	owner, err := strconv.ParseUint(pair[1], 16, 64)
+	if err != nil {
+		return nil, err
+	}
+	return &ownerKey{sid, owner}, nil
 }
 
 func loadLocks(d []byte) []plockRecord {
@@ -174,10 +199,10 @@ func loadLocks(d []byte) []plockRecord {
 func dumpLocks(ls []plockRecord) []byte {
 	wb := utils.NewBuffer(uint32(len(ls)) * 24)
 	for _, l := range ls {
-		wb.Put32(l.ltype)
-		wb.Put32(l.pid)
-		wb.Put64(l.start)
-		wb.Put64(l.end)
+		wb.Put32(l.Type)
+		wb.Put32(l.Pid)
+		wb.Put64(l.Start)
+		wb.Put64(l.End)
 	}
 	return wb.Bytes()
 }
@@ -185,47 +210,47 @@ func dumpLocks(ls []plockRecord) []byte {
 func updateLocks(ls []plockRecord, nl plockRecord) []plockRecord {
 	// ls is ordered by l.start without overlap
 	size := len(ls)
-	for i := 0; i < size && nl.start <= nl.end; i++ {
+	for i := 0; i < size && nl.Start <= nl.End; i++ {
 		l := ls[i]
-		if nl.start < l.start && nl.end >= l.start {
+		if nl.Start < l.Start && nl.End >= l.Start {
 			// split nl
 			ls = append(ls, nl)
-			ls[len(ls)-1].end = l.start - 1
-			nl.start = l.start
+			ls[len(ls)-1].End = l.Start - 1
+			nl.Start = l.Start
 		}
-		if nl.start > l.start && nl.start <= l.end {
+		if nl.Start > l.Start && nl.Start <= l.End {
 			// split l
-			l.end = nl.start - 1
+			l.End = nl.Start - 1
 			ls = append(ls, l)
-			ls[i].start = nl.start
+			ls[i].Start = nl.Start
 			l = ls[i]
 		}
-		if nl.start == l.start {
-			ls[i].ltype = nl.ltype // update l
-			ls[i].pid = nl.pid
-			if l.end > nl.end {
+		if nl.Start == l.Start {
+			ls[i].Type = nl.Type // update l
+			ls[i].Pid = nl.Pid
+			if l.End > nl.End {
 				// split l
-				ls[i].end = nl.end
-				l.start = nl.end + 1
+				ls[i].End = nl.End
+				l.Start = nl.End + 1
 				ls = append(ls, l)
 			}
-			nl.start = ls[i].end + 1
+			nl.Start = ls[i].End + 1
 		}
 	}
-	if nl.start <= nl.end {
+	if nl.Start <= nl.End {
 		ls = append(ls, nl)
 	}
-	sort.Slice(ls, func(i, j int) bool { return ls[i].start < ls[j].start })
+	sort.Slice(ls, func(i, j int) bool { return ls[i].Start < ls[j].Start })
 	for i := 0; i < len(ls); {
-		if ls[i].ltype == F_UNLCK || ls[i].start > ls[i].end {
+		if ls[i].Type == F_UNLCK || ls[i].Start > ls[i].End {
 			// remove empty one
 			copy(ls[i:], ls[i+1:])
 			ls = ls[:len(ls)-1]
 		} else {
-			if i+1 < len(ls) && ls[i].ltype == ls[i+1].ltype && ls[i].pid == ls[i+1].pid && ls[i].end+1 == ls[i+1].start {
+			if i+1 < len(ls) && ls[i].Type == ls[i+1].Type && ls[i].Pid == ls[i+1].Pid && ls[i].End+1 == ls[i+1].Start {
 				// combine continuous range
-				ls[i].end = ls[i+1].end
-				ls[i+1].start = ls[i+1].end + 1
+				ls[i].End = ls[i+1].End
+				ls[i+1].Start = ls[i+1].End + 1
 			}
 			i++
 		}
@@ -233,10 +258,7 @@ func updateLocks(ls []plockRecord, nl plockRecord) []plockRecord {
 	return ls
 }
 
-func (m *baseMeta) emptyDir(ctx Context, inode Ino, count *uint64, concurrent chan int) syscall.Errno {
-	if st := m.Access(ctx, inode, 3, nil); st != 0 {
-		return st
-	}
+func (m *baseMeta) emptyDir(ctx Context, inode Ino, skipCheckTrash bool, count *uint64, concurrent chan int) syscall.Errno {
 	for {
 		var entries []*Entry
 		if st := m.en.doReaddir(ctx, inode, 0, &entries, 10000); st != 0 && st != syscall.ENOENT {
@@ -244,6 +266,9 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, count *uint64, concurrent ch
 		}
 		if len(entries) == 0 {
 			return 0
+		}
+		if st := m.Access(ctx, inode, MODE_MASK_W|MODE_MASK_X, nil); st != 0 {
+			return st
 		}
 		var wg sync.WaitGroup
 		var status syscall.Errno
@@ -262,14 +287,15 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, count *uint64, concurrent ch
 					wg.Add(1)
 					go func(child Ino, name string) {
 						defer wg.Done()
-						e := m.emptyEntry(ctx, inode, name, child, count, concurrent)
-						if e != 0 && e != syscall.ENOENT {
-							status = e
+						st := m.emptyEntry(ctx, inode, name, child, skipCheckTrash, count, concurrent)
+						if st != 0 && st != syscall.ENOENT {
+							status = st
 						}
 						<-concurrent
 					}(e.Inode, string(e.Name))
 				default:
-					if st := m.emptyEntry(ctx, inode, string(e.Name), e.Inode, count, concurrent); st != 0 && st != syscall.ENOENT {
+					if st := m.emptyEntry(ctx, inode, string(e.Name), e.Inode, skipCheckTrash, count, concurrent); st != 0 && st != syscall.ENOENT {
+						ctx.Cancel()
 						return st
 					}
 				}
@@ -277,7 +303,8 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, count *uint64, concurrent ch
 				if count != nil {
 					atomic.AddUint64(count, 1)
 				}
-				if st := m.Unlink(ctx, inode, string(e.Name)); st != 0 && st != syscall.ENOENT {
+				if st := m.Unlink(ctx, inode, string(e.Name), skipCheckTrash); st != 0 && st != syscall.ENOENT {
+					ctx.Cancel()
 					return st
 				}
 			}
@@ -287,18 +314,19 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, count *uint64, concurrent ch
 			entries[i] = nil // release memory
 		}
 		wg.Wait()
-		if status != 0 {
+		if status != 0 || inode == TrashInode { // try only once for .trash
 			return status
 		}
 	}
 }
 
-func (m *baseMeta) emptyEntry(ctx Context, parent Ino, name string, inode Ino, count *uint64, concurrent chan int) syscall.Errno {
-	st := m.emptyDir(ctx, inode, count, concurrent)
-	if st == 0 {
-		st = m.Rmdir(ctx, parent, name)
+func (m *baseMeta) emptyEntry(ctx Context, parent Ino, name string, inode Ino, skipCheckTrash bool, count *uint64, concurrent chan int) syscall.Errno {
+	st := m.emptyDir(ctx, inode, skipCheckTrash, count, concurrent)
+	if st == 0 && !isTrash(inode) {
+		st = m.Rmdir(ctx, parent, name, skipCheckTrash)
 		if st == syscall.ENOTEMPTY {
-			st = m.emptyEntry(ctx, parent, name, inode, count, concurrent)
+			// redo when concurrent conflict may happen
+			st = m.emptyEntry(ctx, parent, name, inode, skipCheckTrash, count, concurrent)
 		} else if count != nil {
 			atomic.AddUint64(count, 1)
 		}
@@ -306,14 +334,14 @@ func (m *baseMeta) emptyEntry(ctx Context, parent Ino, name string, inode Ino, c
 	return st
 }
 
-func (m *baseMeta) Remove(ctx Context, parent Ino, name string, count *uint64) syscall.Errno {
+func (m *baseMeta) Remove(ctx Context, parent Ino, name string, skipTrash bool, numThreads int, count *uint64) syscall.Errno {
 	parent = m.checkRoot(parent)
-	if st := m.Access(ctx, parent, 3, nil); st != 0 {
+	if st := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, nil); st != 0 {
 		return st
 	}
 	var inode Ino
 	var attr Attr
-	if st := m.Lookup(ctx, parent, name, &inode, &attr); st != 0 {
+	if st := m.Lookup(ctx, parent, name, &inode, &attr, false); st != 0 {
 		return st
 	}
 	if attr.Typ != TypeDirectory {
@@ -322,45 +350,250 @@ func (m *baseMeta) Remove(ctx Context, parent Ino, name string, count *uint64) s
 		}
 		return m.Unlink(ctx, parent, name)
 	}
-	concurrent := make(chan int, 50)
-	return m.emptyEntry(ctx, parent, name, inode, count, concurrent)
+	if numThreads <= 0 {
+		logger.Infof("invalid threads number %d , auto adjust to %d", numThreads, RmrDefaultThreads)
+		numThreads = RmrDefaultThreads
+	} else if numThreads > 255 {
+		logger.Infof("threads number %d too large, auto adjust to 255 .", numThreads)
+		numThreads = 255
+	}
+	logger.Debugf("Start emptyEntry with %d concurrent threads .", numThreads)
+	concurrent := make(chan int, numThreads)
+	return m.emptyEntry(ctx, parent, name, inode, skipTrash, count, concurrent)
 }
 
-func GetSummary(r Meta, ctx Context, inode Ino, summary *Summary, recursive bool) syscall.Errno {
+func (m *baseMeta) GetSummary(ctx Context, inode Ino, summary *Summary, recursive bool, strict bool) syscall.Errno {
 	var attr Attr
-	if st := r.GetAttr(ctx, inode, &attr); st != 0 {
+	if st := m.GetAttr(ctx, inode, &attr); st != 0 {
 		return st
 	}
-	if attr.Typ == TypeDirectory {
-		var entries []*Entry
-		if st := r.Readdir(ctx, inode, 1, &entries); st != 0 {
-			return st
+	if attr.Typ != TypeDirectory {
+		if attr.Typ == TypeDirectory {
+			summary.Dirs++
+		} else {
+			summary.Files++
 		}
-		for _, e := range entries {
-			if e.Inode == inode || len(e.Name) == 2 && bytes.Equal(e.Name, []byte("..")) {
-				continue
-			}
-			if e.Attr.Typ == TypeDirectory {
-				if recursive {
-					if st := GetSummary(r, ctx, e.Inode, summary, recursive); st != 0 {
-						return st
-					}
-				} else {
-					summary.Dirs++
-					summary.Size += 4096
-				}
-			} else {
-				summary.Files++
-				summary.Length += e.Attr.Length
-				summary.Size += uint64(align4K(e.Attr.Length))
-			}
-		}
-		summary.Dirs++
-		summary.Size += 4096
-	} else {
-		summary.Files++
-		summary.Length += attr.Length
 		summary.Size += uint64(align4K(attr.Length))
+		if attr.Typ == TypeFile {
+			summary.Length += attr.Length
+		}
+		return 0
+	}
+	summary.Dirs++
+	summary.Size += uint64(align4K(0))
+	concurrent := make(chan struct{}, 50)
+	inode = m.checkRoot(inode)
+	return m.getDirSummary(ctx, inode, summary, recursive, strict, concurrent, nil)
+}
+
+func (m *baseMeta) getDirSummary(ctx Context, inode Ino, summary *Summary, recursive bool, strict bool, concurrent chan struct{}, updateProgress func(count uint64, bytes uint64)) syscall.Errno {
+	var entries []*Entry
+	var err syscall.Errno
+	format := m.getFormat()
+	if strict || !format.DirStats {
+		err = m.en.doReaddir(ctx, inode, 1, &entries, -1)
+	} else {
+		var st *dirStat
+		st, err = m.GetDirStat(ctx, inode)
+		if err != 0 {
+			return err
+		}
+		atomic.AddUint64(&summary.Size, uint64(st.space))
+		atomic.AddUint64(&summary.Length, uint64(st.length))
+		if updateProgress != nil {
+			updateProgress(uint64(st.inodes), uint64(st.space))
+		}
+		var attr Attr
+		err = m.en.doGetAttr(ctx, inode, &attr)
+		if err == 0 {
+			if attr.Nlink > 2 {
+				err = m.en.doReaddir(ctx, inode, 0, &entries, -1)
+			} else {
+				atomic.AddUint64(&summary.Files, uint64(st.inodes))
+			}
+		}
+	}
+	if err != 0 {
+		return err
+	}
+
+	var wg sync.WaitGroup
+	var errCh = make(chan syscall.Errno, 1)
+	for _, e := range entries {
+		if e.Attr.Typ == TypeDirectory {
+			atomic.AddUint64(&summary.Dirs, 1)
+		} else {
+			atomic.AddUint64(&summary.Files, 1)
+		}
+		if strict || !format.DirStats {
+			atomic.AddUint64(&summary.Size, uint64(align4K(e.Attr.Length)))
+			if e.Attr.Typ == TypeFile {
+				atomic.AddUint64(&summary.Length, e.Attr.Length)
+			}
+			if updateProgress != nil {
+				updateProgress(1, uint64(align4K(e.Attr.Length)))
+			}
+		}
+		if e.Attr.Typ != TypeDirectory || !recursive {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return syscall.EINTR
+		case err := <-errCh:
+			// TODO: cancel others
+			return err
+		case concurrent <- struct{}{}:
+			wg.Add(1)
+			go func(e *Entry) {
+				defer wg.Done()
+				err := m.getDirSummary(ctx, e.Inode, summary, recursive, strict, concurrent, updateProgress)
+				<-concurrent
+				if err != 0 && err != syscall.ENOENT {
+					select {
+					case errCh <- err:
+					default:
+					}
+				}
+			}(e)
+		default:
+			if err := m.getDirSummary(ctx, e.Inode, summary, recursive, strict, concurrent, updateProgress); err != 0 && err != syscall.ENOENT {
+				return err
+			}
+		}
+	}
+	wg.Wait()
+	select {
+	case err = <-errCh:
+	default:
+	}
+	return err
+}
+
+func (m *baseMeta) GetTreeSummary(ctx Context, root *TreeSummary, depth, topN uint8, strict bool,
+	updateProgress func(count uint64, bytes uint64)) syscall.Errno {
+	var attr Attr
+	if st := m.GetAttr(ctx, root.Inode, &attr); st != 0 {
+		return st
+	}
+	if updateProgress != nil {
+		updateProgress(1, uint64(align4K(0)))
+	}
+	if attr.Typ != TypeDirectory {
+		root.Files++
+		root.Size += uint64(align4K(attr.Length))
+		return 0
+	}
+	root.Dirs++
+	root.Size += uint64(align4K(0))
+	concurrent := make(chan struct{}, 50)
+	root.Inode = m.checkRoot(root.Inode)
+	return m.getTreeSummary(ctx, root, depth, topN, strict, concurrent, updateProgress)
+}
+
+func (m *baseMeta) getTreeSummary(ctx Context, tree *TreeSummary, depth, topN uint8, strict bool, concurrent chan struct{},
+	updateProgress func(count uint64, bytes uint64)) syscall.Errno {
+	if depth <= 0 {
+		var summary Summary
+		err := m.getDirSummary(ctx, tree.Inode, &summary, true, strict, concurrent, updateProgress)
+		if err == 0 {
+			tree.Dirs += summary.Dirs
+			tree.Files += summary.Files
+			tree.Size += summary.Size
+		}
+		return err
+	}
+
+	var entries []*Entry
+	if err := m.en.doReaddir(ctx, tree.Inode, 1, &entries, -1); err != 0 {
+		return err
+	}
+	var wg sync.WaitGroup
+	tree.Children = make([]*TreeSummary, len(entries))
+	errCh := make(chan syscall.Errno, 1)
+	var err syscall.Errno
+	for i, e := range entries {
+		child := &TreeSummary{
+			Inode: e.Inode,
+			Path:  path.Join(tree.Path, string(e.Name)),
+			Type:  e.Attr.Typ,
+			Size:  uint64(align4K(e.Attr.Length)),
+		}
+		tree.Children[i] = child
+		if updateProgress != nil {
+			updateProgress(1, uint64(align4K(e.Attr.Length)))
+		}
+		if e.Attr.Typ != TypeDirectory {
+			child.Files++
+			continue
+		}
+		child.Dirs++
+		select {
+		case <-ctx.Done():
+			return syscall.EINTR
+		case err = <-errCh:
+			return err
+		case concurrent <- struct{}{}:
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				err := m.getTreeSummary(ctx, child, depth-1, topN, strict, concurrent, updateProgress)
+				<-concurrent
+				if err != 0 && err != syscall.ENOENT {
+					select {
+					case errCh <- err:
+					default:
+					}
+				}
+			}()
+		default:
+			if err = m.getTreeSummary(ctx, child, depth-1, topN, strict, concurrent, updateProgress); err != 0 && err != syscall.ENOENT {
+				return err
+			}
+		}
+	}
+	wg.Wait()
+	select {
+	case err = <-errCh:
+		return err
+	default:
+	}
+
+	// pick top N
+	for _, c := range tree.Children {
+		tree.Dirs += c.Dirs
+		tree.Files += c.Files
+		tree.Size += c.Size
+	}
+	sort.Slice(tree.Children, func(i, j int) bool {
+		return tree.Children[i].Size > tree.Children[j].Size
+	})
+	if len(tree.Children) > int(topN) {
+		omitChild := &TreeSummary{
+			Path: path.Join(tree.Path, "..."),
+			Type: TypeFile,
+		}
+		for _, child := range tree.Children[topN:] {
+			omitChild.Size += child.Size
+			omitChild.Files += child.Files
+			omitChild.Dirs += child.Dirs
+		}
+		tree.Children = append(tree.Children[:topN], omitChild)
 	}
 	return 0
+}
+
+func (m *baseMeta) atimeNeedsUpdate(attr *Attr, now time.Time) bool {
+	return m.conf.AtimeMode != NoAtime && relatimeNeedUpdate(attr, now) ||
+		// update atime only for > 1 second accesses
+		m.conf.AtimeMode == StrictAtime && now.Sub(time.Unix(attr.Atime, int64(attr.Atimensec))) > time.Second
+}
+
+// With relative atime, only update atime if the previous atime is earlier than either the ctime or
+// mtime or if at least a day has passed since the last atime update.
+func relatimeNeedUpdate(attr *Attr, now time.Time) bool {
+	atime := time.Unix(attr.Atime, int64(attr.Atimensec))
+	mtime := time.Unix(attr.Mtime, int64(attr.Mtimensec))
+	ctime := time.Unix(attr.Ctime, int64(attr.Ctimensec))
+	return mtime.After(atime) || ctime.After(atime) || now.Sub(atime) > 24*time.Hour
 }

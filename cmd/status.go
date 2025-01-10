@@ -19,8 +19,12 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"syscall"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/utils"
+
 	"github.com/urfave/cli/v2"
 )
 
@@ -45,13 +49,34 @@ $ juicefs status redis://localhost`,
 				Aliases: []string{"s"},
 				Usage:   "show detailed information (sustained inodes, locks) of the specified session (sid)",
 			},
+			&cli.BoolFlag{
+				Name:    "more",
+				Aliases: []string{"m"},
+				Usage:   "show more statistic information, may take a long time",
+			},
 		},
 	}
 }
 
 type sections struct {
-	Setting  *meta.Format
-	Sessions []*meta.Session
+	Setting   *meta.Format
+	Sessions  []*meta.Session
+	Statistic *statistic
+}
+
+type statistic struct {
+	UsedSpace                uint64
+	AvailableSpace           uint64
+	UsedInodes               uint64
+	AvailableInodes          uint64
+	TrashFileCount           int64 `json:",omitempty"`
+	TrashFileSize            int64 `json:",omitempty"`
+	PendingDeletedFileCount  int64 `json:",omitempty"`
+	PendingDeletedFileSize   int64 `json:",omitempty"`
+	TrashSliceCount          int64 `json:",omitempty"`
+	TrashSliceSize           int64 `json:",omitempty"`
+	PendingDeletedSliceCount int64 `json:",omitempty"`
+	PendingDeletedSliceSize  int64 `json:",omitempty"`
 }
 
 func printJson(v interface{}) {
@@ -65,7 +90,7 @@ func printJson(v interface{}) {
 func status(ctx *cli.Context) error {
 	setup(ctx, 1)
 	removePassword(ctx.Args().Get(0))
-	m := meta.NewClient(ctx.Args().Get(0), &meta.Config{Retries: 10, Strict: true})
+	m := meta.NewClient(ctx.Args().Get(0), nil)
 	format, err := m.Load(true)
 	if err != nil {
 		logger.Fatalf("load setting: %s", err)
@@ -86,6 +111,54 @@ func status(ctx *cli.Context) error {
 		logger.Fatalf("list sessions: %s", err)
 	}
 
-	printJson(&sections{format, sessions})
+	stat := &statistic{}
+	var totalSpace uint64
+	if err = m.StatFS(meta.Background(), meta.RootInode, &totalSpace, &stat.AvailableSpace, &stat.UsedInodes, &stat.AvailableInodes); err != syscall.Errno(0) {
+		logger.Fatalf("stat fs: %s", err)
+	}
+	stat.UsedSpace = totalSpace - stat.AvailableSpace
+
+	if ctx.Bool("more") {
+		progress := utils.NewProgress(false)
+		trashFileSpinner := progress.AddDoubleSpinner("Trash Files")
+		pendingDeletedFileSpinner := progress.AddDoubleSpinner("Pending Deleted Files")
+		trashSlicesSpinner := progress.AddDoubleSpinner("Trash Slices")
+		pendingDeletedSlicesSpinner := progress.AddDoubleSpinner("Pending Deleted Slices")
+		err = m.ScanDeletedObject(
+			meta.WrapContext(ctx.Context),
+			func(ss []meta.Slice, _ int64) (bool, error) {
+				for _, s := range ss {
+					trashSlicesSpinner.IncrInt64(int64(s.Size))
+				}
+				return false, nil
+			},
+			func(_ uint64, size uint32) (bool, error) {
+				pendingDeletedSlicesSpinner.IncrInt64(int64(size))
+				return false, nil
+			},
+			func(_ meta.Ino, size uint64, _ time.Time) (bool, error) {
+				trashFileSpinner.IncrInt64(int64(size))
+				return false, nil
+			},
+			func(_ meta.Ino, size uint64, _ int64) (bool, error) {
+				pendingDeletedFileSpinner.IncrInt64(int64(size))
+				return false, nil
+			},
+		)
+		if err != nil {
+			logger.Fatalf("statistic: %s", err)
+		}
+		trashSlicesSpinner.Done()
+		pendingDeletedSlicesSpinner.Done()
+		trashFileSpinner.Done()
+		pendingDeletedFileSpinner.Done()
+		progress.Done()
+		stat.TrashSliceCount, stat.TrashSliceSize = trashSlicesSpinner.Current()
+		stat.PendingDeletedSliceCount, stat.PendingDeletedSliceSize = pendingDeletedSlicesSpinner.Current()
+		stat.TrashFileCount, stat.TrashFileSize = trashFileSpinner.Current()
+		stat.PendingDeletedFileCount, stat.PendingDeletedFileSize = pendingDeletedFileSpinner.Current()
+	}
+
+	printJson(&sections{format, sessions, stat})
 	return nil
 }

@@ -21,7 +21,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -37,32 +36,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/google/uuid"
 	"github.com/juicedata/juicefs/pkg/compress"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	osync "github.com/juicedata/juicefs/pkg/sync"
+	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/urfave/cli/v2"
 )
 
 func cmdFormat() *cli.Command {
-	var defaultBucket = "/var/jfs"
-	switch runtime.GOOS {
-	case "linux":
-		if os.Getuid() == 0 {
-			break
-		}
-		fallthrough
-	case "darwin":
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			logger.Fatalf("%v", err)
-		}
-		defaultBucket = path.Join(homeDir, ".juicefs", "local")
-	case "windows":
-		defaultBucket = path.Join("C:/jfs/local")
-	}
 	return &cli.Command{
 		Name:      "format",
 		Action:    format,
@@ -89,92 +74,132 @@ $ juicefs format mysql://jfs:mypassword@(127.0.0.1:3306)/juicefs myjfs
 $ META_PASSWORD=mypassword juicefs format mysql://jfs:@(127.0.0.1:3306)/juicefs myjfs
 
 # Create a volume with "quota" enabled
-$ juicefs format sqlite3://myjfs.db myjfs --inode 1000000 --capacity 102400
+$ juicefs format sqlite3://myjfs.db myjfs --inodes 1000000 --capacity 102400
 
 # Create a volume with "trash" disabled
 $ juicefs format sqlite3://myjfs.db myjfs --trash-days 0
 
 Details: https://juicefs.com/docs/community/quick_start_guide`,
-		Flags: []cli.Flag{
-			&cli.IntFlag{
-				Name:  "block-size",
-				Value: 4096,
-				Usage: "size of block in KiB",
-			},
-			&cli.Uint64Flag{
-				Name:  "capacity",
-				Value: 0,
-				Usage: "hard quota of the volume limiting its usage of space in GiB",
-			},
-			&cli.Uint64Flag{
-				Name:  "inodes",
-				Value: 0,
-				Usage: "hard quota of the volume limiting its number of inodes",
-			},
-			&cli.StringFlag{
-				Name:  "compress",
-				Value: "none",
-				Usage: "compression algorithm (lz4, zstd, none)",
-			},
-			&cli.IntFlag{
-				Name:  "shards",
-				Value: 0,
-				Usage: "store the blocks into N buckets by hash of key",
-			},
-			&cli.StringFlag{
-				Name:  "storage",
-				Value: "file",
-				Usage: "object storage type (e.g. s3, gcs, oss, cos)",
-			},
-			&cli.StringFlag{
-				Name:  "bucket",
-				Value: defaultBucket,
-				Usage: "the bucket URL of object storage to store data",
-			},
-			&cli.StringFlag{
-				Name:  "access-key",
-				Usage: "access key for object storage (env ACCESS_KEY)",
-			},
-			&cli.StringFlag{
-				Name:  "secret-key",
-				Usage: "secret key for object storage (env SECRET_KEY)",
-			},
-			&cli.StringFlag{
-				Name:  "session-token",
-				Usage: "session token for object storage",
-			},
-			&cli.StringFlag{
-				Name:  "encrypt-rsa-key",
-				Usage: "a path to RSA private key (PEM)",
-			},
-			&cli.StringFlag{
-				Name:  "encrypt-algo",
-				Usage: "encrypt algorithm (aes256gcm-rsa, chacha20-rsa)",
-				Value: object.AES256GCM_RSA,
-			},
-			&cli.IntFlag{
-				Name:  "trash-days",
-				Value: 1,
-				Usage: "number of days after which removed files will be permanently deleted",
-			},
-			&cli.BoolFlag{
-				Name:  "hash-prefix",
-				Usage: "give each object a hashed prefix",
-			},
-			&cli.BoolFlag{
-				Name:  "force",
-				Usage: "overwrite existing format",
-			},
-			&cli.BoolFlag{
-				Name:  "no-update",
-				Usage: "don't update existing volume",
-			},
-		},
+		Flags: expandFlags(
+			formatStorageFlags(),
+			formatFlags(),
+			formatManagementFlags(),
+			[]cli.Flag{
+				&cli.BoolFlag{
+					Name:  "force",
+					Usage: "overwrite existing format",
+				},
+				&cli.BoolFlag{
+					Name:  "no-update",
+					Usage: "don't update existing volume",
+				},
+			}),
 	}
 }
 
-func fixObjectSize(s int) int {
-	const min, max = 64, 16 << 10
+func formatStorageFlags() []cli.Flag {
+	var defaultBucket = "/var/jfs"
+	switch runtime.GOOS {
+	case "linux":
+		if os.Getuid() == 0 {
+			break
+		}
+		fallthrough
+	case "darwin":
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			logger.Fatalf("%v", err)
+		}
+		defaultBucket = path.Join(homeDir, ".juicefs", "local")
+	case "windows":
+		defaultBucket = path.Join("C:/jfs/local")
+	}
+	return addCategories("DATA STORAGE", []cli.Flag{
+		&cli.StringFlag{
+			Name:  "storage",
+			Value: "file",
+			Usage: "object storage type (e.g. s3, gs, oss, cos)",
+		},
+		&cli.StringFlag{
+			Name:  "bucket",
+			Value: defaultBucket,
+			Usage: "the bucket URL of object storage to store data",
+		},
+		&cli.StringFlag{
+			Name:  "access-key",
+			Usage: "access key for object storage (env ACCESS_KEY)",
+		},
+		&cli.StringFlag{
+			Name:  "secret-key",
+			Usage: "secret key for object storage (env SECRET_KEY)",
+		},
+		&cli.StringFlag{
+			Name:  "session-token",
+			Usage: "session token for object storage",
+		},
+		&cli.StringFlag{
+			Name:  "storage-class",
+			Usage: "the default storage class",
+		},
+	})
+}
+
+func formatFlags() []cli.Flag {
+	return addCategories("DATA FORMAT", []cli.Flag{
+		&cli.StringFlag{
+			Name:  "block-size",
+			Value: "4M",
+			Usage: "size of block in KiB",
+		},
+		&cli.StringFlag{
+			Name:  "compress",
+			Value: "none",
+			Usage: "compression algorithm (lz4, zstd, none)",
+		},
+		&cli.StringFlag{
+			Name:  "encrypt-rsa-key",
+			Usage: "a path to RSA private key (PEM)",
+		},
+		&cli.StringFlag{
+			Name:  "encrypt-algo",
+			Usage: "encrypt algorithm (aes256gcm-rsa, chacha20-rsa)",
+			Value: object.AES256GCM_RSA,
+		},
+		&cli.BoolFlag{
+			Name:  "hash-prefix",
+			Usage: "add a hash prefix to name of objects",
+		},
+		&cli.IntFlag{
+			Name:  "shards",
+			Usage: "store the blocks into N buckets by hash of key",
+		},
+	})
+}
+
+func formatManagementFlags() []cli.Flag {
+	return addCategories("MANAGEMENT", []cli.Flag{
+		&cli.StringFlag{
+			Name:  "capacity",
+			Usage: "hard quota of the volume limiting its usage of space in GiB",
+		},
+		&cli.Uint64Flag{
+			Name:  "inodes",
+			Usage: "hard quota of the volume limiting its number of inodes",
+		},
+		&cli.IntFlag{
+			Name:  "trash-days",
+			Value: 1,
+			Usage: "number of days after which removed files will be permanently deleted",
+		},
+		&cli.BoolFlag{
+			Name:  "enable-acl",
+			Usage: "enable POSIX ACL (this flag is irreversible once enabled)",
+		},
+	})
+}
+
+func fixObjectSize(s uint64) uint64 {
+	const min, max = 64 << 10, 16 << 20
 	var bits uint
 	for s > 1 {
 		bits++
@@ -182,23 +207,23 @@ func fixObjectSize(s int) int {
 	}
 	s = s << bits
 	if s < min {
-		logger.Warnf("block size is too small: %d, use %d instead", s, min)
+		logger.Warnf("block size is too small: %s, use %s instead", humanize.IBytes(s), humanize.IBytes(min))
 		s = min
 	} else if s > max {
-		logger.Warnf("block size is too large: %d, use %d instead", s, max)
+		logger.Warnf("block size is too large: %s, use %s instead", humanize.IBytes(s), humanize.IBytes(max))
 		s = max
 	}
 	return s
 }
 
 func createStorage(format meta.Format) (object.ObjectStorage, error) {
+
 	if err := format.Decrypt(); err != nil {
 		return nil, fmt.Errorf("format decrypt: %s", err)
 	}
 	object.UserAgent = "JuiceFS-" + version.Version()
 	var blob object.ObjectStorage
 	var err error
-
 	if u, err := url.Parse(format.Bucket); err == nil {
 		values := u.Query()
 		if values.Get("tls-insecure-skip-verify") != "" {
@@ -206,10 +231,32 @@ func createStorage(format meta.Format) (object.ObjectStorage, error) {
 			if tlsSkipVerify, err = strconv.ParseBool(values.Get("tls-insecure-skip-verify")); err != nil {
 				return nil, err
 			}
-			object.GetHttpClient().Transport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: tlsSkipVerify}
+			object.GetHttpClient().Transport.(*http.Transport).TLSClientConfig.InsecureSkipVerify = tlsSkipVerify
 			values.Del("tls-insecure-skip-verify")
 			u.RawQuery = values.Encode()
 			format.Bucket = u.String()
+		}
+
+		// Configure client TLS when params are provided
+		if values.Get("ca-certs") != "" && values.Get("ssl-cert") != "" && values.Get("ssl-key") != "" {
+
+			clientTLSCert, err := tls.LoadX509KeyPair(values.Get("ssl-cert"), values.Get("ssl-key"))
+			if err != nil {
+				return nil, fmt.Errorf("error loading certificate and key file: %s", err.Error())
+			}
+
+			certPool := x509.NewCertPool()
+			caCertPEM, err := os.ReadFile(values.Get("ca-certs"))
+			if err != nil {
+				return nil, fmt.Errorf("error loading CA cert file: %s", err.Error())
+			}
+
+			if certAdded := certPool.AppendCertsFromPEM(caCertPEM); !certAdded {
+				return nil, fmt.Errorf("error appending CA cert to pool")
+			}
+
+			object.GetHttpClient().Transport.(*http.Transport).TLSClientConfig.RootCAs = certPool
+			object.GetHttpClient().Transport.(*http.Transport).TLSClientConfig.Certificates = []tls.Certificate{clientTLSCert}
 		}
 	}
 
@@ -222,25 +269,29 @@ func createStorage(format meta.Format) (object.ObjectStorage, error) {
 		return nil, err
 	}
 	blob = object.WithPrefix(blob, format.Name+"/")
-
+	if format.StorageClass != "" {
+		if os, ok := blob.(object.SupportStorageClass); ok {
+			err := os.SetStorageClass(format.StorageClass)
+			if err != nil {
+				logger.Warnf("set storage class %q: %v", format.StorageClass, err)
+			}
+		} else {
+			logger.Warnf("Storage class is not supported by %q, will ignore", format.Storage)
+		}
+	}
 	if format.EncryptKey != "" {
 		passphrase := os.Getenv("JFS_RSA_PASSPHRASE")
-		block, _ := pem.Decode([]byte(format.EncryptKey))
-		if block == nil {
-			return nil, errors.New("failed to parse PEM block containing the key")
-		}
-		// nolint:staticcheck
-		if strings.Contains(block.Headers["Proc-Type"], "ENCRYPTED") && x509.IsEncryptedPEMBlock(block) {
-			if passphrase == "" {
+		if passphrase == "" {
+			block, _ := pem.Decode([]byte(format.EncryptKey))
+			// nolint:staticcheck
+			if block != nil && strings.Contains(block.Headers["Proc-Type"], "ENCRYPTED") && x509.IsEncryptedPEMBlock(block) {
 				return nil, fmt.Errorf("passphrase is required to private key, please try again after setting the 'JFS_RSA_PASSPHRASE' environment variable")
 			}
-		} else if passphrase != "" {
-			logger.Warningf("passphrase is not used, because private key is not encrypted")
 		}
 
-		privKey, err := object.ParseRsaPrivateKeyFromPem(block, passphrase)
+		privKey, err := object.ParseRsaPrivateKeyFromPem([]byte(format.EncryptKey), []byte(passphrase))
 		if err != nil {
-			return nil, fmt.Errorf("incorrect passphrase: %s", err)
+			return nil, fmt.Errorf("parse rsa: %s", err)
 		}
 		encryptor, err := object.NewDataEncryptor(object.NewRSAEncryptor(privKey), format.EncryptAlgo)
 		if err != nil {
@@ -255,8 +306,9 @@ var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ012345
 
 func randSeq(n int) string {
 	b := make([]rune, n)
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
+		b[i] = letters[r.Intn(len(letters))]
 	}
 	return string(b)
 }
@@ -289,37 +341,51 @@ func doTesting(store object.ObjectStorage, key string, data []byte) error {
 		return err
 	}
 	if !bytes.Equal(data, data2) {
-		return fmt.Errorf("Read wrong data")
+		return fmt.Errorf("read wrong data: expected %x, got %x", data, data2)
 	}
 	err = store.Delete(key)
 	if err != nil {
-		// it's OK to don't have delete permission
-		fmt.Printf("Failed to delete: %s", err)
+		// it's OK to don't have delete permission, but we should warn user explicitly
+		logger.Warnf("Failed to delete, err: %s", err)
 	}
 	return nil
 }
 
 func test(store object.ObjectStorage) error {
-	rand.Seed(time.Now().UnixNano())
 	key := "testing/" + randSeq(10)
 	data := make([]byte, 100)
-	_, _ = rand.Read(data)
+	utils.RandRead(data)
 	nRetry := 3
 	var err error
 	for i := 0; i < nRetry; i++ {
 		err = doTesting(store, key, data)
 		if err == nil {
-			return nil
+			break
 		}
+		logger.Warnf("Test storage %s failed: %s, tries: #%d", store, err, i+1)
 		time.Sleep(time.Second * time.Duration(i*3+1))
 	}
+	if err == nil {
+		_ = store.Delete("testing/")
+	}
 	return err
+}
+
+func loadEncrypt(keyPath string) string {
+	if keyPath == "" {
+		return ""
+	}
+	pem, err := os.ReadFile(keyPath)
+	if err != nil {
+		logger.Fatalf("load RSA key from %s: %s", keyPath, err)
+	}
+	return string(pem)
 }
 
 func format(c *cli.Context) error {
 	setup(c, 2)
 	removePassword(c.Args().Get(0))
-	m := meta.NewClient(c.Args().Get(0), &meta.Config{Retries: 2})
+	m := meta.NewClient(c.Args().Get(0), nil)
 	name := c.Args().Get(1)
 	validName := regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$`)
 	if !validName.MatchString(name) {
@@ -334,16 +400,7 @@ func format(c *cli.Context) error {
 	if v := c.Int("shards"); v > 256 {
 		logger.Fatalf("too many shards: %d", v)
 	}
-	loadEncrypt := func(keyPath string) string {
-		if keyPath == "" {
-			return ""
-		}
-		pem, err := os.ReadFile(keyPath)
-		if err != nil {
-			logger.Fatalf("load RSA key from %s: %s", keyPath, err)
-		}
-		return string(pem)
-	}
+
 	var create, encrypted bool
 	format, err := m.Load(false)
 	if err == nil {
@@ -354,7 +411,7 @@ func format(c *cli.Context) error {
 		for _, flag := range c.LocalFlagNames() {
 			switch flag {
 			case "capacity":
-				format.Capacity = c.Uint64(flag) << 30
+				format.Capacity = utils.ParseBytes(c, flag, 'G')
 			case "inodes":
 				format.Inodes = c.Uint64(flag)
 			case "bucket":
@@ -367,7 +424,7 @@ func format(c *cli.Context) error {
 					logger.Warnf("decrypt secrets: %s", err)
 				}
 				format.SecretKey = c.String(flag)
-			case "session-key":
+			case "session-token":
 				encrypted = format.KeyEncrypted
 				if err := format.Decrypt(); err != nil && strings.Contains(err.Error(), "secret was removed") {
 					logger.Warnf("decrypt secrets: %s", err)
@@ -376,7 +433,7 @@ func format(c *cli.Context) error {
 			case "trash-days":
 				format.TrashDays = c.Int(flag)
 			case "block-size":
-				format.BlockSize = fixObjectSize(c.Int(flag))
+				format.BlockSize = int(fixObjectSize(utils.ParseBytes(c, flag, 'K')) >> 10)
 			case "compress":
 				format.Compression = c.String(flag)
 			case "shards":
@@ -392,24 +449,32 @@ func format(c *cli.Context) error {
 	} else if strings.HasPrefix(err.Error(), "database is not formatted") {
 		create = true
 		format = &meta.Format{
-			Name:         name,
-			UUID:         uuid.New().String(),
-			Storage:      c.String("storage"),
-			Bucket:       c.String("bucket"),
-			AccessKey:    c.String("access-key"),
-			SecretKey:    c.String("secret-key"),
-			SessionToken: c.String("session-token"),
-			EncryptKey:   loadEncrypt(c.String("encrypt-rsa-key")),
-			EncryptAlgo:  c.String("encrypt-algo"),
-			Shards:       c.Int("shards"),
-			HashPrefix:   c.Bool("hash-prefix"),
-			Capacity:     c.Uint64("capacity") << 30,
-			Inodes:       c.Uint64("inodes"),
-			BlockSize:    fixObjectSize(c.Int("block-size")),
-			Compression:  c.String("compress"),
-			TrashDays:    c.Int("trash-days"),
-			MetaVersion:  meta.MaxVersion,
+			Name:             name,
+			UUID:             uuid.New().String(),
+			Storage:          c.String("storage"),
+			StorageClass:     c.String("storage-class"),
+			Bucket:           c.String("bucket"),
+			AccessKey:        c.String("access-key"),
+			SecretKey:        c.String("secret-key"),
+			SessionToken:     c.String("session-token"),
+			EncryptKey:       loadEncrypt(c.String("encrypt-rsa-key")),
+			EncryptAlgo:      c.String("encrypt-algo"),
+			Shards:           c.Int("shards"),
+			HashPrefix:       c.Bool("hash-prefix"),
+			Capacity:         utils.ParseBytes(c, "capacity", 'G'),
+			Inodes:           c.Uint64("inodes"),
+			BlockSize:        int(fixObjectSize(utils.ParseBytes(c, "block-size", 'K')) >> 10),
+			Compression:      c.String("compress"),
+			TrashDays:        c.Int("trash-days"),
+			DirStats:         true,
+			MetaVersion:      meta.MaxVersion,
+			MinClientVersion: "1.1.0-A",
+			EnableACL:        c.Bool("enable-acl"),
 		}
+		if format.EnableACL {
+			format.MinClientVersion = "1.2.0-A"
+		}
+
 		if format.AccessKey == "" && os.Getenv("ACCESS_KEY") != "" {
 			format.AccessKey = os.Getenv("ACCESS_KEY")
 			_ = os.Unsetenv("ACCESS_KEY")
@@ -447,14 +512,14 @@ func format(c *cli.Context) error {
 			logger.Fatalf("Storage %s is not configured correctly: %s", blob, err)
 		}
 		if create {
-			if objs, err := osync.ListAll(blob, "", ""); err == nil {
+			if objs, err := osync.ListAll(blob, "", "", "", true); err == nil {
 				for o := range objs {
 					if o == nil {
 						logger.Warnf("List storage %s failed", blob)
 						break
-					} else if o.IsDir() {
+					} else if o.IsDir() || o.Size() == 0 {
 						continue
-					} else if !strings.HasPrefix(o.Key(), "testing/") {
+					} else if o.Key() != "testing" && !strings.HasPrefix(o.Key(), "testing/") {
 						logger.Fatalf("Storage %s is not empty; please clean it up or pick another volume name", blob)
 					}
 				}
@@ -472,7 +537,7 @@ func format(c *cli.Context) error {
 			logger.Fatalf("Format encrypt: %s", err)
 		}
 	}
-	if err = m.Init(*format, c.Bool("force")); err != nil {
+	if err = m.Init(format, c.Bool("force")); err != nil {
 		if create {
 			_ = blob.Delete("juicefs_uuid")
 		}

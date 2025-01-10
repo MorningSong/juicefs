@@ -18,12 +18,13 @@ package cmd
 
 import (
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/juicedata/juicefs/pkg/winfsp"
 	"github.com/urfave/cli/v2"
 )
 
-func mount_flags() []cli.Flag {
+func mountFlags() []cli.Flag {
 	return []cli.Flag{
 		&cli.StringFlag{
 			Name:  "o",
@@ -45,14 +46,30 @@ func mount_flags() []cli.Flag {
 	}
 }
 
-func makeDaemon(c *cli.Context, name, mp string, m meta.Meta) error {
+func makeDaemon(c *cli.Context, conf *vfs.Config) error {
 	logger.Warnf("Cannot run in background in Windows.")
 	return nil
 }
 
-func mount_main(v *vfs.VFS, c *cli.Context) {
+func makeDaemonForSvc(c *cli.Context, m meta.Meta, metaUrl, listenAddr string) error {
+	logger.Warnf("Cannot run in background in Windows.")
+	return nil
+}
+
+func getDaemonStage() int {
+	return 0
+}
+
+func mountMain(v *vfs.VFS, c *cli.Context) {
 	winfsp.Serve(v, c.String("o"), c.Float64("file-cache-to"), c.Bool("as-root"), c.Int("delay-close"))
 }
 
-func checkMountpoint(name, mp, logPath string, background bool) {
-}
+func checkMountpoint(name, mp, logPath string, background bool) {}
+
+func prepareMp(mp string) {}
+
+func setFuseOption(c *cli.Context, format *meta.Format, vfsConf *vfs.Config) {}
+
+func launchMount(mp string, conf *vfs.Config) error { return nil }
+
+func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorage) {}

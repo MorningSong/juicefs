@@ -19,7 +19,6 @@ package cmd
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -57,7 +56,7 @@ func TestSync(t *testing.T) {
 	}
 
 	for _, instance := range testInstances {
-		c, err := ioutil.ReadFile(fmt.Sprintf("%s/%s", localDir, instance.path))
+		c, err := os.ReadFile(fmt.Sprintf("%s/%s", localDir, instance.path))
 		if err != nil || string(c) != instance.content {
 			t.Fatalf("sync failed: %v", err)
 		}
@@ -88,6 +87,33 @@ func Test_isS3PathType(t *testing.T) {
 		t.Run("Test host", func(t *testing.T) {
 			if got := isS3PathType(tt.endpoint); got != tt.want {
 				t.Errorf("isS3PathType() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_extractToken(t *testing.T) {
+	// [NAME://][ACCESS_KEY:SECRET_KEY[:TOKEN]@]BUCKET[.ENDPOINT][/PREFIX]
+	tests := []struct {
+		uri, removedTokenUri, token string
+	}{
+		{"NAME://ACCESS_KEY:SECRET_KEY@BUCKET.ENDPOINT/PREFIX", "NAME://ACCESS_KEY:SECRET_KEY@BUCKET.ENDPOINT/PREFIX", ""},
+		{"NAME://:@BUCKET.ENDPOINT/PREFIX", "NAME://:@BUCKET.ENDPOINT/PREFIX", ""},
+		{"NAME://ACCESS_KEY:SECRET_KEY:TOKEN@BUCKET.ENDPOINT/PREFIX", "NAME://ACCESS_KEY:SECRET_KEY@BUCKET.ENDPOINT/PREFIX", "TOKEN"},
+		{"NAME://:@BUCKET.ENDPOINT/PREFIX", "NAME://:@BUCKET.ENDPOINT/PREFIX", ""},
+		{"NAME://::TOKEN@BUCKET.ENDPOINT/PREFIX", "NAME://:@BUCKET.ENDPOINT/PREFIX", "TOKEN"},
+		{"NAME://BUCKET.ENDPOINT/PREFIX", "NAME://BUCKET.ENDPOINT/PREFIX", ""},
+		{"file:///tmp/testbucket", "file:///tmp/testbucket", ""},
+		{"/tmp/testbucket", "/tmp/testbucket", ""},
+	}
+	for _, tt := range tests {
+		t.Run("", func(t *testing.T) {
+			removedTokenUri, token := extractToken(tt.uri)
+			if removedTokenUri != tt.removedTokenUri {
+				t.Errorf("extractToken() removedTokenUri = %v, want %v", removedTokenUri, tt.removedTokenUri)
+			}
+			if token != tt.token {
+				t.Errorf("extractToken() token = %v, want %v", token, tt.token)
 			}
 		})
 	}

@@ -1,9 +1,8 @@
 ---
-sidebar_label: Use JuiceFS on Tencent Cloud
-sidebar_position: 7
+title: Use JuiceFS on Tencent Cloud
+sidebar_position: 8
 slug: /clouds/qcloud
 ---
-# Use JuiceFS on Tencent Cloud
 
 JuiceFS needs to be used with database and object storage together. Here we directly use Tencent Cloud's CVM cloud server, combined with cloud database and COS object storage.
 
@@ -37,7 +36,7 @@ JuiceFS will store all the metadata corresponding to the data in a separate data
 
 Depending on the database type, the performance and reliability of metadata varies. For example, Redis runs entirely on memory, which provides the ultimate performance, but is difficult to operate and maintain, and has relatively low reliability. SQLite is a single-file relational database with low performance and is not suitable for large-scale data storage, but it is configuration-free and suitable for scenarios with small amounts of data storage.
 
-If you are just evaluating the capabilities of JuiceFS, you can manually build the database for use in the CVM. When you want to use JucieFS in a production environment, the cloud database service of Tencent Cloud is usually a better choice if you don't have a professional database operation and maintenance team.
+If you are just evaluating the capabilities of JuiceFS, you can manually build the database for use in the CVM. When you want to use JuiceFS in a production environment, the cloud database service of Tencent Cloud is usually a better choice if you don't have a professional database operation and maintenance team.
 
 Of course, you can also use cloud database services provided on other cloud platforms if you wish.However, in this case, you can only access the cloud database through the public network, which means that you must expose the database port to the public network, which has some security risks and requires special attention.
 
@@ -78,27 +77,13 @@ Tencent Cloud COS needs to be accessed through API, you need to prepare the acce
 
 ## Installation
 
-Here we are using Ubuntu Server 20.04 64-bit system, and the latest version of the client can be downloaded by running the following commands. You can also choose another version by visiting the [JuiceFS GitHub Releases](https://github.com/juicedata/juicefs/releases) page.
+Here we are using Ubuntu Server 20.04 64-bit system, and the latest version of the client can be installed by running the following command.
 
 ```shell
-JFS_LATEST_TAG=$(curl -s https://api.github.com/repos/juicedata/juicefs/releases/latest | grep 'tag_name' | cut -d '"' -f 4 | tr -d 'v')
+curl -sSL https://d.juicefs.com/install | sh -
 ```
 
-```shell
-wget "https://github.com/juicedata/juicefs/releases/download/v${JFS_LATEST_TAG}/juicefs-${JFS_LATEST_TAG}-linux-amd64.tar.gz"
-```
-
-After downloading, unzip the program into the `juice` folder.
-
-```shell
-mkdir juice && tar -zxvf "juicefs-${JFS_LATEST_TAG}-linux-amd64.tar.gz" -C juice
-```
-
-Install the JuiceFS client to `/usr/local/bin` :
-
-```shell
-sudo install juice/juicefs /usr/local/bin
-```
+You can also choose another version by visiting the [JuiceFS GitHub Releases](https://github.com/juicedata/juicefs/releases) page.
 
 Execute the command and see the help message `juicefs` returned, which means the client installation is successful.
 
@@ -135,7 +120,7 @@ GLOBAL OPTIONS:
    --verbose, --debug, -v  enable debug log (default: false)
    --quiet, -q             only warning and errors (default: false)
    --trace                 enable trace log (default: false)
-   --no-agent              Disable pprof (:6060) and gops (:6070) agent (default: false)
+   --no-agent              disable pprof (:6060) agent (default: false)
    --help, -h              show help (default: false)
    --version, -V           print only the version (default: false)
 
@@ -155,12 +140,12 @@ The following command creates a storage called `mystor`, i.e., a file system, us
 
 ```shell
 $ juicefs format \
-	--storage cos \
-	--bucket https://<your-bucket-name> \
-	--access-key <your-access-key-id> \
-	--secret-key <your-access-key-secret> \
-	redis://:<your-redis-password>@192.168.5.5:6379/1 \
-	mystor
+    --storage cos \
+    --bucket https://<your-bucket-name> \
+    --access-key <your-access-key-id> \
+    --secret-key <your-access-key-secret> \
+    redis://:<your-redis-password>@192.168.5.5:6379/1 \
+    mystor
 ```
 
 **Option description:**
@@ -271,24 +256,6 @@ sudo juicefs umount /mnt/jfs
 
 > **Note**: Forced unmount of the file system in use may result in data corruption or loss, so please be sure to proceed with caution.
 
-## Auto-mount on Boot
+## Auto-mount on boot
 
-If you don't want to manually remount JuiceFS storage on reboot, you can set up automatic mounting of the file system.
-
-First, you need to rename the `juicefs` client to `mount.juicefs` and copy it to the `/sbin/` directory.
-
-```shell
-sudo cp juice/juicefs /sbin/mount.juicefs
-```
-
-Edit the `/etc/fstab` configuration file and add a new record.
-
-```shell
-redis://:<your-redis-password>@192.168.5.5:6379/1    /mnt/jfs       juicefs     _netdev,cache-size=20480     0  0
-```
-
-The mount option `cache-size=20480` means to allocate 20GB local disk space for JuiceFS cache use. Generally speaking, allocating more cache space for JuiceFS will result in better performance.
-
-You can adjust the FUSE mount options in the above configuration as needed, for more information please [check the documentation](../reference/fuse_mount_options.md).
-
-> **Note**: Please replace the Redis address, mount point, and mount options in the above configuration file with your actual information.
+Please refer to ["Mount JuiceFS at Boot Time"](../administration/mount_at_boot.md) for more details.

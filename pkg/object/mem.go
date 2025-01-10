@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"sort"
 	"strings"
@@ -65,6 +64,7 @@ func (m *memStore) Head(key string) (Object, error) {
 			int64(len(o.data)),
 			o.mtime,
 			strings.HasSuffix(key, "/"),
+			"",
 		},
 		o.owner,
 		o.group,
@@ -74,7 +74,7 @@ func (m *memStore) Head(key string) (Object, error) {
 	return f, nil
 }
 
-func (m *memStore) Get(key string, off, limit int64) (io.ReadCloser, error) {
+func (m *memStore) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
 	m.Lock()
 	defer m.Unlock()
 	// Minimum length is 1.
@@ -92,10 +92,10 @@ func (m *memStore) Get(key string, off, limit int64) (io.ReadCloser, error) {
 	if limit > 0 && limit < int64(len(data)) {
 		data = data[:limit]
 	}
-	return ioutil.NopCloser(bytes.NewBuffer(data)), nil
+	return io.NopCloser(bytes.NewBuffer(data)), nil
 }
 
-func (m *memStore) Put(key string, in io.Reader) error {
+func (m *memStore) Put(key string, in io.Reader, getters ...AttrGetter) error {
 	m.Lock()
 	defer m.Unlock()
 	// Minimum length is 1.
@@ -106,7 +106,7 @@ func (m *memStore) Put(key string, in io.Reader) error {
 	if ok {
 		logger.Debugf("overwrite %s", key)
 	}
-	data, err := ioutil.ReadAll(in)
+	data, err := io.ReadAll(in)
 	if err != nil {
 		return err
 	}
@@ -122,27 +122,55 @@ func (m *memStore) Copy(dst, src string) error {
 	return m.Put(dst, d)
 }
 
-func (m *memStore) Delete(key string) error {
+func (m *memStore) Delete(key string, getters ...AttrGetter) error {
 	m.Lock()
 	defer m.Unlock()
 	delete(m.objects, key)
 	return nil
 }
 
-func (m *memStore) List(prefix, marker string, limit int64) ([]Object, error) {
+func (m *memStore) List(prefix, marker, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
 	m.Lock()
 	defer m.Unlock()
 
 	objs := make([]Object, 0)
+	commonPrefixsMap := make(map[string]bool, 0)
 	for k := range m.objects {
 		if strings.HasPrefix(k, prefix) && k > marker {
 			o := m.objects[k]
+			if delimiter != "" {
+				remainString := strings.TrimPrefix(k, prefix)
+				if pos := strings.Index(remainString, delimiter); pos != -1 {
+					commonPrefix := remainString[0 : pos+1]
+					if _, ok := commonPrefixsMap[commonPrefix]; ok {
+						continue
+					}
+					f := &file{
+						obj{
+							prefix + commonPrefix,
+							0,
+							time.Unix(0, 0),
+							strings.HasSuffix(commonPrefix, "/"),
+							"",
+						},
+						o.owner,
+						o.group,
+						o.mode,
+						false,
+					}
+					objs = append(objs, f)
+					commonPrefixsMap[commonPrefix] = true
+					continue
+				}
+			}
+
 			f := &file{
 				obj{
 					k,
 					int64(len(o.data)),
 					o.mtime,
 					strings.HasSuffix(k, "/"),
+					"",
 				},
 				o.owner,
 				o.group,
@@ -158,11 +186,7 @@ func (m *memStore) List(prefix, marker string, limit int64) ([]Object, error) {
 	if int64(len(objs)) > limit {
 		objs = objs[:limit]
 	}
-	return objs, nil
-}
-
-func (m *memStore) ListAll(prefix, marker string) (<-chan Object, error) {
-	return nil, notSupported
+	return generateListResult(objs, limit)
 }
 
 func newMem(endpoint, accesskey, secretkey, token string) (ObjectStorage, error) {

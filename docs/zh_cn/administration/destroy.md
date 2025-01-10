@@ -1,8 +1,7 @@
 ---
-sidebar_label: 销毁文件系统
-position: 7
+title: 销毁文件系统
+sidebar_position: 8
 ---
-# 如何销毁文件系统
 
 JuiceFS 客户端提供了 `destroy` 命令用以彻底销毁一个文件系统，销毁操作将会产生以下结果：
 
@@ -62,7 +61,7 @@ $ juicefs destroy redis://127.0.0.1:6379/1 eabb96d5-7228-461e-9240-fddbf2b576d8
 data storage: file://jfs/
   used bytes: 18620416
  used inodes: 23
-WARNING: The target volume will be destoried permanently, including:
+WARNING: The target volume will be destroyed permanently, including:
 WARNING: 1. objects in the data storage
 WARNING: 2. entries in the metadata engine
 Proceed anyway? [y/N]: y

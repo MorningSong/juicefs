@@ -23,23 +23,27 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/IBM/ibm-cos-sdk-go/aws"
 	"github.com/IBM/ibm-cos-sdk-go/aws/awserr"
 	"github.com/IBM/ibm-cos-sdk-go/aws/credentials/ibmiam"
+	"github.com/IBM/ibm-cos-sdk-go/aws/request"
 	"github.com/IBM/ibm-cos-sdk-go/aws/session"
 	"github.com/IBM/ibm-cos-sdk-go/service/s3"
 	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/pkg/errors"
 )
 
 type ibmcos struct {
 	bucket string
 	s3     *s3.S3
+	sc     string
 }
 
 func (s *ibmcos) String() string {
@@ -47,14 +51,30 @@ func (s *ibmcos) String() string {
 }
 
 func (s *ibmcos) Create() error {
-	_, err := s.s3.CreateBucket(&s3.CreateBucketInput{Bucket: &s.bucket})
+	input := &s3.CreateBucketInput{Bucket: &s.bucket}
+	// https://cloud.ibm.com/docs/cloud-object-storage?topic=cloud-object-storage-classes&code=go
+	if s.sc != "" {
+		input.CreateBucketConfiguration = &s3.CreateBucketConfiguration{
+			LocationConstraint: &s.sc,
+		}
+	}
+	_, err := s.s3.CreateBucket(input)
 	if err != nil && isExists(err) {
 		err = nil
 	}
 	return err
 }
 
-func (s *ibmcos) Get(key string, off, limit int64) (io.ReadCloser, error) {
+func (s *ibmcos) Limits() Limits {
+	return Limits{
+		IsSupportMultipartUpload: true,
+		MinPartSize:              5 << 20,
+		MaxPartSize:              5 << 30,
+		MaxPartCount:             10000,
+	}
+}
+
+func (s *ibmcos) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
 	params := &s3.GetObjectInput{Bucket: &s.bucket, Key: &key}
 	if off > 0 || limit > 0 {
 		var r string
@@ -65,19 +85,25 @@ func (s *ibmcos) Get(key string, off, limit int64) (io.ReadCloser, error) {
 		}
 		params.Range = &r
 	}
-	resp, err := s.s3.GetObject(params)
+	var reqID string
+	resp, err := s.s3.GetObjectWithContext(ctx, params, request.WithGetResponseHeader(s3RequestIDKey, &reqID))
+	attrs := applyGetters(getters...)
+	attrs.SetRequestID(reqID)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StorageClass != nil {
+		attrs.SetStorageClass(*resp.StorageClass)
 	}
 	return resp.Body, nil
 }
 
-func (s *ibmcos) Put(key string, in io.Reader) error {
+func (s *ibmcos) Put(key string, in io.Reader, getters ...AttrGetter) error {
 	var body io.ReadSeeker
 	if b, ok := in.(io.ReadSeeker); ok {
 		body = b
 	} else {
-		data, err := ioutil.ReadAll(in)
+		data, err := io.ReadAll(in)
 		if err != nil {
 			return err
 		}
@@ -90,7 +116,13 @@ func (s *ibmcos) Put(key string, in io.Reader) error {
 		Body:        body,
 		ContentType: &mimeType,
 	}
-	_, err := s.s3.PutObject(params)
+	if s.sc != "" {
+		params.SetStorageClass(s.sc)
+	}
+	var reqID string
+	_, err := s.s3.PutObjectWithContext(ctx, params, request.WithGetResponseHeader(s3RequestIDKey, &reqID))
+	attrs := applyGetters(getters...)
+	attrs.SetRequestID(reqID).SetStorageClass(s.sc)
 	return err
 }
 
@@ -100,6 +132,9 @@ func (s *ibmcos) Copy(dst, src string) error {
 		Bucket:     &s.bucket,
 		Key:        &dst,
 		CopySource: &src,
+	}
+	if s.sc != "" {
+		params.SetStorageClass(s.sc)
 	}
 	_, err := s.s3.CopyObject(params)
 	return err
@@ -122,39 +157,61 @@ func (s *ibmcos) Head(key string) (Object, error) {
 		*r.ContentLength,
 		*r.LastModified,
 		strings.HasSuffix(key, "/"),
+		*r.StorageClass,
 	}, nil
 }
 
-func (s *ibmcos) Delete(key string) error {
+func (s *ibmcos) Delete(key string, getters ...AttrGetter) error {
 	param := s3.DeleteObjectInput{
 		Bucket: &s.bucket,
 		Key:    &key,
 	}
-	_, err := s.s3.DeleteObject(&param)
+	var reqID string
+	_, err := s.s3.DeleteObjectWithContext(ctx, &param, request.WithGetResponseHeader(s3RequestIDKey, &reqID))
+	attrs := applyGetters(getters...)
+	attrs.SetRequestID(reqID)
 	return err
 }
 
-func (s *ibmcos) List(prefix, marker string, limit int64) ([]Object, error) {
+func (s *ibmcos) List(prefix, start, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
 	param := s3.ListObjectsInput{
-		Bucket:  &s.bucket,
-		Prefix:  &prefix,
-		Marker:  &marker,
-		MaxKeys: &limit,
+		Bucket:       &s.bucket,
+		Prefix:       &prefix,
+		Marker:       &start,
+		MaxKeys:      &limit,
+		EncodingType: aws.String("url"),
+	}
+	if delimiter != "" {
+		param.Delimiter = &delimiter
 	}
 	resp, err := s.s3.ListObjects(&param)
 	if err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
 	n := len(resp.Contents)
 	objs := make([]Object, n)
 	for i := 0; i < n; i++ {
 		o := resp.Contents[i]
-		objs[i] = &obj{*o.Key, *o.Size, *o.LastModified, strings.HasSuffix(*o.Key, "/")}
+		oKey, err := url.QueryUnescape(*o.Key)
+		if err != nil {
+			return nil, false, "", errors.WithMessagef(err, "failed to decode key %s", *o.Key)
+		}
+		objs[i] = &obj{oKey, *o.Size, *o.LastModified, strings.HasSuffix(oKey, "/"), *o.StorageClass}
 	}
-	return objs, nil
+	if delimiter != "" {
+		for _, p := range resp.CommonPrefixes {
+			prefix, err := url.QueryUnescape(*p.Prefix)
+			if err != nil {
+				return nil, false, "", errors.WithMessagef(err, "failed to decode commonPrefixes %s", *p.Prefix)
+			}
+			objs = append(objs, &obj{prefix, 0, time.Unix(0, 0), true, ""})
+		}
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
+	}
+	return objs, *resp.IsTruncated, *resp.NextMarker, nil
 }
 
-func (s *ibmcos) ListAll(prefix, marker string) (<-chan Object, error) {
+func (s *ibmcos) ListAll(prefix, marker string, followLink bool) (<-chan Object, error) {
 	return nil, notSupported
 }
 
@@ -162,6 +219,9 @@ func (s *ibmcos) CreateMultipartUpload(key string) (*MultipartUpload, error) {
 	params := &s3.CreateMultipartUploadInput{
 		Bucket: &s.bucket,
 		Key:    &key,
+	}
+	if s.sc != "" {
+		params.SetStorageClass(s.sc)
 	}
 	resp, err := s.s3.CreateMultipartUpload(params)
 	if err != nil {
@@ -184,6 +244,10 @@ func (s *ibmcos) UploadPart(key string, uploadID string, num int, body []byte) (
 		return nil, err
 	}
 	return &Part{Num: num, ETag: *resp.ETag}, nil
+}
+
+func (s *ibmcos) UploadPartCopy(key string, uploadID string, num int, srcKey string, off, size int64) (*Part, error) {
+	return nil, notSupported
 }
 
 func (s *ibmcos) AbortUpload(key string, uploadID string) {
@@ -233,6 +297,11 @@ func (s *ibmcos) ListUploads(marker string) ([]*PendingPart, string, error) {
 	return parts, nextMarker, nil
 }
 
+func (s *ibmcos) SetStorageClass(sc string) error {
+	s.sc = sc
+	return nil
+}
+
 func newIBMCOS(endpoint, apiKey, serviceInstanceID, token string) (ObjectStorage, error) {
 	if !strings.Contains(endpoint, "://") {
 		endpoint = fmt.Sprintf("https://%s", endpoint)
@@ -248,10 +317,10 @@ func newIBMCOS(endpoint, apiKey, serviceInstanceID, token string) (ObjectStorage
 		WithEndpoint(serviceEndpoint).
 		WithCredentials(ibmiam.NewStaticCredentials(aws.NewConfig(),
 			authEndpoint, apiKey, serviceInstanceID)).
-		WithS3ForcePathStyle(true)
+		WithS3ForcePathStyle(defaultPathStyle())
 	sess := session.Must(session.NewSession())
 	client := s3.New(sess, conf)
-	return &ibmcos{bucket, client}, nil
+	return &ibmcos{bucket: bucket, s3: client}, nil
 }
 
 func init() {

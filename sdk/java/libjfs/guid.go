@@ -33,6 +33,7 @@ type mapping struct {
 	sync.Mutex
 	salt      string
 	local     bool
+	mask      uint32
 	usernames map[string]uint32
 	userIDs   map[uint32]string
 	groups    map[string]uint32
@@ -55,7 +56,11 @@ func (m *mapping) genGuid(name string) uint32 {
 	digest := md5.Sum([]byte(m.salt + name + m.salt))
 	a := binary.LittleEndian.Uint64(digest[0:8])
 	b := binary.LittleEndian.Uint64(digest[8:16])
-	return uint32(a ^ b)
+	id := uint32(a ^ b)
+	if m.mask > 0 {
+		id &= m.mask
+	}
+	return id
 }
 
 func (m *mapping) lookupUser(name string) uint32 {
@@ -66,17 +71,24 @@ func (m *mapping) lookupUser(name string) uint32 {
 		return id
 	}
 	if !m.local {
-		return m.genGuid(name)
+		id := m.genGuid(name)
+		m.usernames[name] = id
+		m.userIDs[id] = name
+		return id
 	}
-	u, _ := user.Lookup(name)
-	if u != nil {
-		id_, _ := strconv.ParseUint(u.Uid, 10, 32)
-		id = uint32(id_)
-	} else {
+	if name == "root" { // root in hdfs sdk is a normal user
 		id = m.genGuid(name)
+	} else {
+		u, _ := user.Lookup(name)
+		if u != nil {
+			id_, _ := strconv.ParseUint(u.Uid, 10, 32)
+			id = uint32(id_)
+		} else {
+			id = m.genGuid(name)
+		}
 	}
-	m.usernames[name] = id
-	m.userIDs[id] = name
+	logger.Debugf("update user to %s:%d by lookup user", name, id)
+	m.updateUser(name, id)
 	return id
 }
 
@@ -90,16 +102,20 @@ func (m *mapping) lookupGroup(name string) uint32 {
 	if !m.local {
 		return m.genGuid(name)
 	}
-	g, _ := user.LookupGroup(name)
-	if g == nil {
+	if name == "root" {
 		id = m.genGuid(name)
 	} else {
-		id_, _ := strconv.ParseUint(g.Gid, 10, 32)
-		id = uint32(id_)
+		g, _ := user.LookupGroup(name)
+		if g == nil {
+			id = m.genGuid(name)
+		} else {
+			id_, _ := strconv.ParseUint(g.Gid, 10, 32)
+			id = uint32(id_)
+		}
 	}
-	m.groups[name] = id
-	m.groupIDs[id] = name
-	return 0
+	logger.Debugf("update group to %s:%d by lookup group", name, id)
+	m.updateGroup(name, id)
+	return id
 }
 
 func (m *mapping) lookupUserID(id uint32) string {
@@ -119,8 +135,8 @@ func (m *mapping) lookupUserID(id uint32) string {
 	if len(name) > 49 {
 		name = name[:49]
 	}
-	m.usernames[name] = id
-	m.userIDs[id] = name
+	logger.Debugf("update user to %s:%d by lookup user id", name, id)
+	m.updateUser(name, id)
 	return name
 }
 
@@ -141,8 +157,8 @@ func (m *mapping) lookupGroupID(id uint32) string {
 	if len(name) > 49 {
 		name = name[:49]
 	}
-	m.groups[name] = id
-	m.groupIDs[id] = name
+	logger.Debugf("update group to %s:%d by lookup group id", name, id)
+	m.updateGroup(name, id)
 	return name
 }
 
@@ -151,19 +167,31 @@ func (m *mapping) update(uids []pwent, gids []pwent, local bool) {
 	defer m.Unlock()
 	m.local = local
 	for _, u := range uids {
-		oldId := m.usernames[u.name]
-		oldName := m.userIDs[u.id]
-		delete(m.userIDs, oldId)
-		delete(m.usernames, oldName)
-		m.usernames[u.name] = u.id
-		m.userIDs[u.id] = u.name
+		m.updateUser(u.name, u.id)
 	}
 	for _, g := range gids {
-		oldId := m.groups[g.name]
-		oldName := m.groupIDs[g.id]
-		delete(m.groupIDs, oldId)
-		delete(m.groups, oldName)
-		m.groups[g.name] = g.id
-		m.groupIDs[g.id] = g.name
+		m.updateGroup(g.name, g.id)
 	}
+	logger.Debugf("users:\n%+v", m.usernames)
+	logger.Debugf("userids:\n%+v", m.userIDs)
+	logger.Debugf("groups:\n%+v", m.groups)
+	logger.Debugf("gorupids:\n%+v", m.groupIDs)
+}
+
+func (m *mapping) updateUser(name string, id uint32) {
+	oldId := m.usernames[name]
+	oldName := m.userIDs[id]
+	delete(m.userIDs, oldId)
+	delete(m.usernames, oldName)
+	m.usernames[name] = id
+	m.userIDs[id] = name
+}
+
+func (m *mapping) updateGroup(name string, id uint32) {
+	oldId := m.groups[name]
+	oldName := m.groupIDs[id]
+	delete(m.groupIDs, oldId)
+	delete(m.groups, oldName)
+	m.groups[name] = id
+	m.groupIDs[id] = name
 }

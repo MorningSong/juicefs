@@ -23,13 +23,16 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
-	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/pkg/errors"
+
+	aws2 "github.com/aws/aws-sdk-go/aws"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/ks3sdklib/aws-sdk-go/aws"
 	"github.com/ks3sdklib/aws-sdk-go/aws/awserr"
@@ -37,10 +40,12 @@ import (
 	"github.com/ks3sdklib/aws-sdk-go/service/s3"
 )
 
+const s3StorageClassHdr = "X-Amz-Storage-Class"
+
 type ks3 struct {
 	bucket string
 	s3     *s3.S3
-	ses    *session.Session
+	sc     string
 }
 
 func (s *ks3) String() string {
@@ -53,6 +58,16 @@ func (s *ks3) Create() error {
 		err = nil
 	}
 	return err
+}
+
+func (s *ks3) Limits() Limits {
+	return Limits{
+		IsSupportMultipartUpload: true,
+		IsSupportUploadPartCopy:  true,
+		MinPartSize:              5 << 20,
+		MaxPartSize:              5 << 30,
+		MaxPartCount:             10000,
+	}
 }
 
 func (s *ks3) Head(key string) (Object, error) {
@@ -69,15 +84,22 @@ func (s *ks3) Head(key string) (Object, error) {
 		return nil, err
 	}
 
+	var sc string
+	if val, ok := r.Metadata[s3StorageClassHdr]; ok {
+		sc = *val
+	} else {
+		sc = "STANDARD"
+	}
 	return &obj{
 		key,
 		*r.ContentLength,
 		*r.LastModified,
 		strings.HasSuffix(key, "/"),
+		sc,
 	}, nil
 }
 
-func (s *ks3) Get(key string, off, limit int64) (io.ReadCloser, error) {
+func (s *ks3) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
 	params := &s3.GetObjectInput{Bucket: &s.bucket, Key: &key}
 	if off > 0 || limit > 0 {
 		var r string
@@ -89,18 +111,23 @@ func (s *ks3) Get(key string, off, limit int64) (io.ReadCloser, error) {
 		params.Range = &r
 	}
 	resp, err := s.s3.GetObject(params)
+	if resp != nil {
+		attrs := applyGetters(getters...)
+		attrs.SetRequestID(aws2.StringValue(resp.Metadata[s3RequestIDKey]))
+		attrs.SetStorageClass(aws2.StringValue(resp.Metadata[s3StorageClassHdr]))
+	}
 	if err != nil {
 		return nil, err
 	}
 	return resp.Body, nil
 }
 
-func (s *ks3) Put(key string, in io.Reader) error {
+func (s *ks3) Put(key string, in io.Reader, getters ...AttrGetter) error {
 	var body io.ReadSeeker
 	if b, ok := in.(io.ReadSeeker); ok {
 		body = b
 	} else {
-		data, err := ioutil.ReadAll(in)
+		data, err := io.ReadAll(in)
 		if err != nil {
 			return err
 		}
@@ -113,7 +140,14 @@ func (s *ks3) Put(key string, in io.Reader) error {
 		Body:        body,
 		ContentType: &mimeType,
 	}
-	_, err := s.s3.PutObject(params)
+	if s.sc != "" {
+		params.StorageClass = aws.String(s.sc)
+	}
+	resp, err := s.s3.PutObject(params)
+	if resp != nil {
+		attrs := applyGetters(getters...)
+		attrs.SetRequestID(aws2.StringValue(resp.Metadata[s3RequestIDKey])).SetStorageClass(s.sc)
+	}
 	return err
 }
 func (s *ks3) Copy(dst, src string) error {
@@ -123,43 +157,72 @@ func (s *ks3) Copy(dst, src string) error {
 		Key:        &dst,
 		CopySource: &src,
 	}
+	if s.sc != "" {
+		params.StorageClass = aws.String(s.sc)
+	}
 	_, err := s.s3.CopyObject(params)
 	return err
 }
 
-func (s *ks3) Delete(key string) error {
+func (s *ks3) Delete(key string, getters ...AttrGetter) error {
 	param := s3.DeleteObjectInput{
 		Bucket: &s.bucket,
 		Key:    &key,
 	}
-	_, err := s.s3.DeleteObject(&param)
+	resp, err := s.s3.DeleteObject(&param)
+	if resp != nil {
+		attrs := applyGetters(getters...)
+		attrs.SetRequestID(aws2.StringValue(resp.Metadata[s3RequestIDKey]))
+	}
 	if e, ok := err.(awserr.RequestFailure); ok && e.StatusCode() == http.StatusNotFound {
 		return nil
 	}
 	return err
 }
 
-func (s *ks3) List(prefix, marker string, limit int64) ([]Object, error) {
+func (s *ks3) List(prefix, start, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
 	param := s3.ListObjectsInput{
-		Bucket:  &s.bucket,
-		Prefix:  &prefix,
-		Marker:  &marker,
-		MaxKeys: &limit,
+		Bucket:       &s.bucket,
+		Prefix:       &prefix,
+		Marker:       &start,
+		MaxKeys:      &limit,
+		EncodingType: aws.String("url"),
+	}
+	if delimiter != "" {
+		param.Delimiter = &delimiter
 	}
 	resp, err := s.s3.ListObjects(&param)
 	if err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
 	n := len(resp.Contents)
 	objs := make([]Object, n)
 	for i := 0; i < n; i++ {
 		o := resp.Contents[i]
-		objs[i] = &obj{*o.Key, *o.Size, *o.LastModified, strings.HasSuffix(*o.Key, "/")}
+		oKey, err := url.QueryUnescape(*o.Key)
+		if err != nil {
+			return nil, false, "", errors.WithMessagef(err, "failed to decode key %s", *o.Key)
+		}
+		objs[i] = &obj{oKey, *o.Size, *o.LastModified, strings.HasSuffix(oKey, "/"), *o.StorageClass}
 	}
-	return objs, nil
+	if delimiter != "" {
+		for _, p := range resp.CommonPrefixes {
+			prefix, err := url.QueryUnescape(*p.Prefix)
+			if err != nil {
+				return nil, false, "", errors.WithMessagef(err, "failed to decode commonPrefixes %s", *p.Prefix)
+			}
+			objs = append(objs, &obj{prefix, 0, time.Unix(0, 0), true, ""})
+		}
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
+	}
+	var nextMarker string
+	if resp.NextMarker != nil {
+		nextMarker = *resp.NextMarker
+	}
+	return objs, *resp.IsTruncated, nextMarker, nil
 }
 
-func (s *ks3) ListAll(prefix, marker string) (<-chan Object, error) {
+func (s *ks3) ListAll(prefix, marker string, followLink bool) (<-chan Object, error) {
 	return nil, notSupported
 }
 
@@ -167,6 +230,9 @@ func (s *ks3) CreateMultipartUpload(key string) (*MultipartUpload, error) {
 	params := &s3.CreateMultipartUploadInput{
 		Bucket: &s.bucket,
 		Key:    &key,
+	}
+	if s.sc != "" {
+		params.StorageClass = aws.String(s.sc)
 	}
 	resp, err := s.s3.CreateMultipartUpload(params)
 	if err != nil {
@@ -189,6 +255,21 @@ func (s *ks3) UploadPart(key string, uploadID string, num int, body []byte) (*Pa
 		return nil, err
 	}
 	return &Part{Num: num, ETag: *resp.ETag}, nil
+}
+
+func (s *ks3) UploadPartCopy(key string, uploadID string, num int, srcKey string, off, size int64) (*Part, error) {
+	resp, err := s.s3.UploadPartCopy(&s3.UploadPartCopyInput{
+		Bucket:          aws.String(s.bucket),
+		CopySource:      aws.String(s.bucket + "/" + srcKey),
+		CopySourceRange: aws.String(fmt.Sprintf("bytes=%d-%d", off, off+size-1)),
+		Key:             aws.String(key),
+		PartNumber:      aws.Long(int64(num)),
+		UploadID:        aws.String(uploadID),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Part{Num: num, ETag: *resp.CopyPartResult.ETag}, nil
 }
 
 func (s *ks3) AbortUpload(key string, uploadID string) {
@@ -238,6 +319,11 @@ func (s *ks3) ListUploads(marker string) ([]*PendingPart, string, error) {
 	return parts, nextMarker, nil
 }
 
+func (s *ks3) SetStorageClass(sc string) error {
+	s.sc = sc
+	return nil
+}
+
 var ks3Regions = map[string]string{
 	"cn-beijing":   "BEIJING",
 	"cn-shanghai":  "SHANGHAI",
@@ -258,12 +344,22 @@ func newKS3(endpoint, accessKey, secretKey, token string) (ObjectStorage, error)
 	uri, _ := url.ParseRequestURI(endpoint)
 	ssl := strings.ToLower(uri.Scheme) == "https"
 	hostParts := strings.Split(uri.Host, ".")
+	if len(hostParts) < 2 {
+		return nil, fmt.Errorf("invalid endpoint: %s", endpoint)
+	}
 	bucket := hostParts[0]
 	region := hostParts[1][3:]
 	region = strings.TrimLeft(region, "-")
-	if strings.HasSuffix(uri.Host, "ksyun.com") {
+	var pathStyle bool = defaultPathStyle()
+	if strings.HasSuffix(uri.Host, "ksyun.com") || strings.HasSuffix(uri.Host, "ksyuncs.com") {
 		region = strings.TrimSuffix(region, "-internal")
 		region = ks3Regions[region]
+		pathStyle = false
+	} else if envRegion := os.Getenv("AWS_REGION"); envRegion != "" {
+		region = envRegion
+	}
+	if region == "" {
+		region = "us-east-1"
 	}
 
 	var err error
@@ -280,11 +376,11 @@ func newKS3(endpoint, accessKey, secretKey, token string) (ObjectStorage, error)
 		Endpoint:         strings.SplitN(uri.Host, ".", 2)[1],
 		DisableSSL:       !ssl,
 		HTTPClient:       httpClient,
-		S3ForcePathStyle: false,
+		S3ForcePathStyle: pathStyle,
 		Credentials:      credentials.NewStaticCredentials(accessKey, secretKey, token),
 	}
 
-	return &ks3{bucket, s3.New(awsConfig), nil}, nil
+	return &ks3{bucket: bucket, s3: s3.New(awsConfig)}, nil
 }
 
 func init() {

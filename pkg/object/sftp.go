@@ -10,10 +10,12 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"math/rand"
 	"net"
+	"net/url"
 	"os"
 	"os/user"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -22,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/pkg/errors"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -150,14 +153,11 @@ func (f *sftpStore) putSftpConnection(pc **conn, err error) {
 }
 
 func (f *sftpStore) String() string {
-	return fmt.Sprintf("%s@%s:%s", f.config.User, f.host, f.root)
+	return fmt.Sprintf("sftp://%s@%s:%s", f.config.User, f.host, f.root)
 }
 
 // always preserve suffix `/` for directory key
 func (f *sftpStore) path(key string) string {
-	if key == "" {
-		return f.root
-	}
 	return f.root + key
 }
 
@@ -172,10 +172,10 @@ func (f *sftpStore) Head(key string) (Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fileInfo(key, info), nil
+	return f.fileInfo(nil, key, info, true), nil
 }
 
-func (f *sftpStore) Get(key string, off, limit int64) (io.ReadCloser, error) {
+func (f *sftpStore) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
 	c, err := f.getSftpConnection()
 	if err != nil {
 		return nil, err
@@ -192,27 +192,19 @@ func (f *sftpStore) Get(key string, off, limit int64) (io.ReadCloser, error) {
 		return nil, err
 	}
 	if finfo.IsDir() {
-		return ioutil.NopCloser(bytes.NewBuffer([]byte{})), nil
+		return io.NopCloser(bytes.NewBuffer([]byte{})), nil
 	}
 
-	if off > 0 {
-		if _, err := ff.Seek(off, 0); err != nil {
-			_ = ff.Close()
-			return nil, err
-		}
-	}
 	if limit > 0 {
-		buf := make([]byte, limit)
-		if n, err := ff.Read(buf); n == 0 && err != nil {
-			return nil, err
-		} else {
-			return ioutil.NopCloser(bytes.NewBuffer(buf[:n])), nil
-		}
+		return &SectionReaderCloser{
+			SectionReader: io.NewSectionReader(ff, off, limit),
+			Closer:        ff,
+		}, nil
 	}
 	return ff, err
 }
 
-func (f *sftpStore) Put(key string, in io.Reader) error {
+func (f *sftpStore) Put(key string, in io.Reader, getters ...AttrGetter) (err error) {
 	c, err := f.getSftpConnection()
 	if err != nil {
 		return err
@@ -226,16 +218,26 @@ func (f *sftpStore) Put(key string, in io.Reader) error {
 	if err := c.sftpClient.MkdirAll(filepath.Dir(p)); err != nil {
 		return err
 	}
-	tmp := filepath.Join(filepath.Dir(p), "."+filepath.Base(p)+".tmp")
-	if runtime.GOOS == "windows" {
-		tmp = strings.Replace(tmp, "\\", "/", -1)
-	}
 
+	var tmp string
+	if PutInplace {
+		tmp = p
+	} else {
+		name := path.Base(p)
+		if len(name) > 200 {
+			name = name[:200]
+		}
+		tmp = path.Join(path.Dir(p), fmt.Sprintf(".%s.tmp.%d", name, rand.Int()))
+		defer func() {
+			if err != nil {
+				_ = c.sftpClient.Remove(tmp)
+			}
+		}()
+	}
 	ff, err := c.sftpClient.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = c.sftpClient.Remove(tmp) }()
 	buf := bufPool.Get().(*[]byte)
 	defer bufPool.Put(buf)
 	_, err = io.CopyBuffer(ff, in, *buf)
@@ -247,8 +249,11 @@ func (f *sftpStore) Put(key string, in io.Reader) error {
 	if err != nil {
 		return err
 	}
-	_ = c.sftpClient.Remove(p)
-	return c.sftpClient.Rename(tmp, p)
+	if !PutInplace {
+		_ = c.sftpClient.Remove(p)
+		return c.sftpClient.Rename(tmp, p)
+	}
+	return nil
 }
 
 func (f *sftpStore) Chtimes(key string, mtime time.Time) error {
@@ -275,141 +280,141 @@ func (f *sftpStore) Chown(key string, owner, group string) error {
 		return err
 	}
 	defer f.putSftpConnection(&c, err)
-	uid := lookupUser(owner)
-	gid := lookupGroup(group)
+	uid := utils.LookupUser(owner)
+	gid := utils.LookupGroup(group)
 	return c.sftpClient.Chown(f.path(key), uid, gid)
 }
 
-func (f *sftpStore) Delete(key string) error {
+func (f *sftpStore) Symlink(oldName, newName string) error {
 	c, err := f.getSftpConnection()
 	if err != nil {
 		return err
 	}
 	defer f.putSftpConnection(&c, err)
-	err = c.sftpClient.Remove(f.path(key))
+	p := f.path(newName)
+	err = c.sftpClient.Symlink(oldName, p)
+	if err != nil && os.IsNotExist(err) {
+		_ = c.sftpClient.MkdirAll(filepath.Dir(p))
+		err = c.sftpClient.Symlink(oldName, p)
+	}
+	return err
+}
+
+func (f *sftpStore) Readlink(name string) (string, error) {
+	c, err := f.getSftpConnection()
+	if err != nil {
+		return "", err
+	}
+	defer f.putSftpConnection(&c, err)
+	return c.sftpClient.ReadLink(f.path(name))
+}
+
+func (f *sftpStore) Delete(key string, getters ...AttrGetter) error {
+	c, err := f.getSftpConnection()
+	if err != nil {
+		return err
+	}
+	defer f.putSftpConnection(&c, err)
+	err = c.sftpClient.Remove(strings.TrimRight(f.path(key), dirSuffix))
 	if err != nil && os.IsNotExist(err) {
 		err = nil
 	}
 	return err
 }
 
-func sortFIsByName(fis []os.FileInfo) {
-	sort.Slice(fis, func(i, j int) bool {
-		name1 := fis[i].Name()
-		if fis[i].IsDir() {
-			name1 += "/"
+func (f *sftpStore) sortByName(c *sftp.Client, path string, fis []os.FileInfo, followLink bool) []Object {
+	var obs = make([]Object, 0, len(fis))
+	for _, fi := range fis {
+		p := path + fi.Name()
+		if strings.HasPrefix(p, f.root) {
+			key := p[len(f.root):]
+			obs = append(obs, f.fileInfo(c, key, fi, followLink))
 		}
-		name2 := fis[j].Name()
-		if fis[j].IsDir() {
-			name2 += "/"
-		}
-		return name1 < name2
-	})
+	}
+	sort.Slice(obs, func(i, j int) bool { return obs[i].Key() < obs[j].Key() })
+	return obs
 }
 
-func fileInfo(key string, fi os.FileInfo) Object {
+func (f *sftpStore) fileInfo(c *sftp.Client, key string, fi os.FileInfo, followLink bool) Object {
 	owner, group := getOwnerGroup(fi)
-	f := &file{
-		obj{key, fi.Size(), fi.ModTime(), fi.IsDir()},
+	isSymlink := !fi.Mode().IsDir() && !fi.Mode().IsRegular()
+	if isSymlink && c != nil && followLink {
+		if fi2, err := c.Stat(f.root + key); err == nil {
+			fi = fi2
+			isSymlink = false
+		}
+	}
+	ff := &file{
+		obj{key, fi.Size(), fi.ModTime(), fi.IsDir(), ""},
 		owner,
 		group,
 		fi.Mode(),
-		!fi.Mode().IsDir() && !fi.Mode().IsRegular(),
+		isSymlink,
 	}
 	if fi.IsDir() {
 		if key != "" && !strings.HasSuffix(key, "/") {
-			f.key += "/"
+			ff.key += "/"
 		}
-		f.size = 0
+		ff.size = 0
 	}
-	return f
+	return ff
 }
 
-func (f *sftpStore) doFind(c *sftp.Client, path, marker string, out chan Object) {
-	infos, err := c.ReadDir(path)
-	if err != nil {
-		logger.Errorf("readdir %s: %s", path, err)
-		return
+func (f *sftpStore) List(prefix, marker, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
+	if delimiter != "/" {
+		return nil, false, "", notSupported
 	}
 
-	sortFIsByName(infos)
-	for _, fi := range infos {
-		p := path + fi.Name()
-		key := p[len(f.root):]
-		if key > marker {
-			out <- fileInfo(key, fi)
-		}
-		if fi.IsDir() && (key > marker || strings.HasPrefix(marker, key)) {
-			f.doFind(c, p+dirSuffix, marker, out)
-		}
-	}
-}
-
-func (f *sftpStore) find(c *sftp.Client, path, marker string, out chan Object) {
-	if strings.HasSuffix(path, dirSuffix) {
-		fi, err := c.Stat(path)
-		if err != nil {
-			logger.Errorf("Stat %s error: %q", path, err)
-			return
-		}
-		if marker == "" {
-			out <- fileInfo(path[len(f.root):], fi)
-		}
-		f.doFind(c, path, marker, out)
-	} else {
-		// As files or dirs in the same directory of file `path` resides
-		// may have prefix `path`, we should list the directory.
-		dir := filepath.Dir(path) + dirSuffix
-		infos, err := c.ReadDir(dir)
-		if err != nil {
-			logger.Errorf("readdir %s: %s", dir, err)
-			return
-		}
-
-		sortFIsByName(infos)
-		for _, fi := range infos {
-			p := dir + fi.Name()
-			if !strings.HasPrefix(p, f.root) {
-				if p > f.root {
-					break
-				}
-				continue
-			}
-
-			key := p[len(f.root):]
-			prefix := path[len(f.root):]
-			if strings.HasPrefix(key, prefix) {
-				if key > marker || marker == "" {
-					out <- fileInfo(key, fi)
-				}
-				if fi.IsDir() && (key > marker || strings.HasPrefix(marker, key)) {
-					f.doFind(c, p+dirSuffix, marker, out)
-				}
-			}
-		}
-	}
-}
-
-func (f *sftpStore) List(prefix, marker string, limit int64) ([]Object, error) {
-	return nil, notSupported
-}
-
-func (f *sftpStore) ListAll(prefix, marker string) (<-chan Object, error) {
 	c, err := f.getSftpConnection()
 	if err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
-	listed := make(chan Object, 10240)
-	go func() {
-		defer f.putSftpConnection(&c, nil)
+	defer f.putSftpConnection(&c, nil)
 
-		f.find(c.sftpClient, f.path(prefix), marker, listed)
-		close(listed)
-	}()
-	return listed, nil
+	var objs []Object
+	dir := f.path(prefix)
+	if !strings.HasSuffix(dir, "/") {
+		dir = filepath.Dir(dir)
+		if !strings.HasSuffix(dir, dirSuffix) {
+			dir += dirSuffix
+		}
+	} else if marker == "" {
+		obj, err := f.Head(prefix)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, false, "", nil
+			}
+			return nil, false, "", err
+		}
+		objs = append(objs, obj)
+	}
+	infos, err := c.sftpClient.ReadDir(dir)
+	if err != nil {
+		if os.IsPermission(err) {
+			logger.Warnf("skip %s: %s", dir, err)
+			return nil, false, "", nil
+		}
+		if os.IsNotExist(err) {
+			return nil, false, "", nil
+		}
+		return nil, false, "", err
+	}
+
+	entries := f.sortByName(c.sftpClient, dir, infos, followLink)
+	for _, o := range entries {
+		key := o.Key()
+		if !strings.HasPrefix(key, prefix) || (marker != "" && key <= marker) {
+			continue
+		}
+		objs = append(objs, o)
+		if len(objs) == int(limit) {
+			break
+		}
+	}
+	return generateListResult(objs, limit)
 }
 
-func SshInteractive(user, instruction string, questions []string, echos []bool) (answers []string, err error) {
+func sshInteractive(user, instruction string, questions []string, echos []bool) (answers []string, err error) {
 	if len(questions) == 0 {
 		fmt.Print(user, instruction)
 	} else {
@@ -429,6 +434,15 @@ func SshInteractive(user, instruction string, questions []string, echos []bool) 
 		}
 	}
 	return answers, nil
+}
+
+func unescape(original string) string {
+	if escaped, err := url.QueryUnescape(original); err != nil {
+		logger.Warnf("unescape(%s) error: %s", original, err)
+		return original
+	} else {
+		return escaped
+	}
 }
 
 func newSftp(endpoint, username, pass, token string) (ObjectStorage, error) {
@@ -455,16 +469,15 @@ func newSftp(endpoint, username, pass, token string) (ObjectStorage, error) {
 			username = u.Username
 		}
 	}
+	username = unescape(username)
 	var auth []ssh.AuthMethod
 	if pass != "" {
-		auth = append(auth, ssh.Password(pass))
-	} else {
-		auth = append(auth, ssh.KeyboardInteractive(SshInteractive))
+		auth = append(auth, ssh.Password(unescape(pass)))
 	}
 
 	var signers []ssh.Signer
 	if privateKeyPath := os.Getenv("SSH_PRIVATE_KEY_PATH"); privateKeyPath != "" {
-		key, err := ioutil.ReadFile(privateKeyPath)
+		key, err := os.ReadFile(privateKeyPath)
 		if err != nil {
 			return nil, fmt.Errorf("unable to read private key, error: %v", err)
 		}
@@ -477,9 +490,9 @@ func newSftp(endpoint, username, pass, token string) (ObjectStorage, error) {
 		home := filepath.Join(os.Getenv("HOME"), ".ssh")
 		var algo = []string{"rsa", "dsa", "ecdsa", "ecdsa_sk", "ed25519", "xmss"}
 		for _, a := range algo {
-			key, err := ioutil.ReadFile(filepath.Join(home, "id_"+a))
+			key, err := os.ReadFile(filepath.Join(home, "id_"+a))
 			if err != nil {
-				key, err = ioutil.ReadFile(filepath.Join(home, "id_"+a+"-cert"))
+				key, err = os.ReadFile(filepath.Join(home, "id_"+a+"-cert"))
 			}
 			if err == nil {
 				signer, err := ssh.ParsePrivateKey(key)
@@ -508,6 +521,10 @@ func newSftp(endpoint, username, pass, token string) (ObjectStorage, error) {
 	}
 	if len(signers) > 0 {
 		auth = append(auth, ssh.PublicKeys(signers...))
+	}
+
+	if pass == "" {
+		auth = append(auth, ssh.KeyboardInteractive(sshInteractive))
 	}
 
 	config := &ssh.ClientConfig{
@@ -540,19 +557,6 @@ func newSftp(endpoint, username, pass, token string) (ObjectStorage, error) {
 		return nil, err
 	}
 	defer f.putSftpConnection(&c, err)
-
-	if strings.HasSuffix(root, dirSuffix) {
-		logger.Debugf("Ensure directory %s", root)
-		if err := c.sftpClient.MkdirAll(root); err != nil {
-			return nil, fmt.Errorf("Creating directory %s failed: %q", root, err)
-		}
-	} else {
-		dir := filepath.Dir(root)
-		logger.Debugf("Ensure directory %s", dir)
-		if err := c.sftpClient.MkdirAll(dir); err != nil {
-			return nil, fmt.Errorf("Creating directory %s failed: %q", dir, err)
-		}
-	}
 
 	return f, nil
 }
