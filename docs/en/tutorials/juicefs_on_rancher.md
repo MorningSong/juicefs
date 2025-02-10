@@ -1,11 +1,10 @@
 ---
-sidebar_label: Use JuiceFS on Rancher
+title: Use JuiceFS on Rancher
 sidebar_position: 2
 slug: /juicefs_on_rancher
 ---
-# Use JuiceFS on Rancher
 
-[Rancher](https://rancher.com/) is an enterprise-level Kubernetes cluster management system, which can be used to quickly complete the deployment of Kubernetes clusters on various cloud computing platforms.
+[Rancher](https://rancher.com) is an enterprise-level Kubernetes cluster management system, which can be used to quickly complete the deployment of Kubernetes clusters on various cloud computing platforms.
 
 Rancher provides a browser-based management interface, even users who are not experienced in Kubernetes can start to manage and use easily. It is preset with Helm-based application market by default, and various Kubernetes applications can be installed very easy under the graphical interface.
 
@@ -29,7 +28,7 @@ sudo docker run --privileged -d --restart=unless-stopped -p 80:80 -p 443:443 ran
 
 After the container is created, Rancher's management interface can be opened by accessing the IP address of the host.
 
-![](../images/rancher-welcome.jpeg)
+![Rancher-welcome](../images/rancher-welcome.jpeg)
 
 ## Create a Kubernetes cluster
 
@@ -37,36 +36,36 @@ After Rancher is installed, you can see that it has deployed a K3s cluster in th
 
 Next, start to create a Kubernetes cluster. In the Cluster section of the welcome page, click `Create` to create a cluster. Rancher supports the creation of Kubernetes clusters on major cloud computing platforms. Here we need to create a cluster directly on Rancher's host, so choose `Custom`. Then fill in the cluster name according to the wizard and select the Kubernetes version.
 
-![](../images/rancher-cluster-create.jpg)
+![Rancher-cluster-create](../images/rancher-cluster-create.jpg)
 
 In the `Cluster Options` page, select the node role to be created, then copy the generated command and execute it on the target host.
 
-![](../images/rancher-cluster-options.jpg)
+![Rancher-cluster-options](../images/rancher-cluster-options.jpg)
 
 After the cluster is created, it will be displayed in Rancher's cluster list.
 
-![](../images/rancher-clusters.jpg)
+![Rancher-clusters](../images/rancher-clusters.jpg)
 
 ## One-click installation of JuiceFS CSI Driver
 
 In the cluster list, click to enter the Kubernetes cluster, click on the left navigation menu to expand `Apps & Marketplace` -> `Chart Repositories`, click the `Create` button to add JuiceFS CSI repository, fill in:
 
-- **Name**: juicefs
-- **Index URL**: https://juicedata.github.io/charts/
+- **Name**: `juicefs`
+- **Index URL**: `https://juicedata.github.io/charts/`
 
-![](../images/rancher-new-repo.jpg)
+![Rancher-new-repo](../images/rancher-new-repo.jpg)
 
 And then, you can see the new repository in the list.
 
-![](../images/rancher-repos.jpg)
+![Rancher-repos](../images/rancher-repos.jpg)
 
 Then click to open the `Apps & Marketplace` → `Charts` from the left menu, type `juicefs` in the search bar, and then click to open `juicefs-csi-driver`.
 
-![](../images/rancher-chart-search.jpg)
+![Rancher-chart-search](../images/rancher-chart-search.jpg)
 
 Click the "Install" button on the application details page, the latest version will be installed by default, or you can click to switch to the historical version to install.
 
-![](../images/rancher-chart-info.jpg)
+![Rancher-chart-info](../images/rancher-chart-info.jpg)
 
 The installation wizard has two steps:
 
@@ -76,7 +75,7 @@ The JuiceFS CSI Driver defaults to `kube-system`, and there is no need to set th
 
 ### Step 2: Adjust configuration parameters
 
-This page provides a YAML editor, you can adjust JuiceFS-related information according to your needs. Usually you only need to modify the `storageClasses` part, where the `backend` part is used to define the backend database and object storage of the file system. You can refer to [JuiceFS Quick Start Guide](../getting-started/README.md) to learn the detail. If you are using a pre-created file system, you only need to fill in the two items `metaurl` and `name`, for example:
+This page provides a YAML editor, you can adjust JuiceFS-related information according to your needs. Usually you only need to modify the `storageClasses` part, where the `backend` part is used to define the backend database and object storage of the file system. If you are using an existing file system, you only need to fill in the two items `metaurl` and `name`, for example:
 
 ```yaml
 ...
@@ -98,10 +97,10 @@ storageClasses:
 
 Click "Install" and wait for the application installation to complete.
 
-![](../images/rancher-chart-installed.jpg)
+![Rancher-chart-installed](../images/rancher-chart-installed.jpg)
 
 ## Use JuiceFS to persist data
 
 When deploying an application, specify `juicefs-sc` in the storage configuration.
 
-![](../images/rancher-pvc.jpg)
+![Rancher-PVC](../images/rancher-pvc.jpg)

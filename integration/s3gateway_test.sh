@@ -17,25 +17,14 @@
 # environment
 
 os="linux"
-errno=$errno
 if [[ `uname  -a` =~ "Darwin" ]];then
     os="mac"
-    errno=254
 fi
 echo "os=$os"
 
 set -x
-os="linux"
-errno=$errno
-if [[ `uname  -a` =~ "Darwin" ]];then
-    os="mac"
-    errno=254
-fi
-echo "os=$os"
-
 
 MINT_DATA_DIR=testdata
-MINT_MODE=core
 SERVER_ENDPOINT="127.0.0.1:9008"
 ACCESS_KEY="testUser"
 SECRET_KEY="testUserPassword"
@@ -43,9 +32,7 @@ ENABLE_HTTPS=0
 SERVER_REGION=us-east-1
 ENABLE_VIRTUAL_STYLE=0
 
-
-
-
+# macos need bash 4.0+
 # create testdata
 declare -A data_file_map
 data_file_map["datafile-0-b"]="0"
@@ -401,7 +388,7 @@ function test_list_objects() {
         fi
     fi
 
-    # if upload objects succeeds, list objects without existing prefix
+    # if upload objects succeeds, list objects with not exist prefix
     if [ $rv -eq 0 ]; then
         function="${AWS} s3api list-objects --bucket ${bucket_name} --prefix linux"
         out=$($function)
@@ -412,6 +399,126 @@ function test_list_objects() {
             out="list-objects without existing prefix failed"
         fi
     fi
+
+    # put dir1/dir2/dir3/dir4/  listobject(prefix=dir1/) should return "dir1/dir2/dir3/dir4/" ...
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api put-object --bucket ${bucket_name} --key dir1/dir2/dir3/dir4/"
+        out=$($function 2>&1)
+        rv=$?
+    else
+        # if make bucket fails, $bucket_name has the error output
+        out="${bucket_name}"
+    fi
+
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api list-objects --bucket ${bucket_name} --prefix dir1/dir2/dir3/dir4/"
+        test_function=${function}
+        out=$($function)
+        rv=$?
+        key_name=$(echo "$out" | jq -r .Contents[0].Key)
+        if [ $rv -eq 0 ] && [ "$key_name" != "dir1/dir2/dir3/dir4/" ]; then
+            rv=1
+            # since rv is 0, command passed, but didn't return expected value. In this case set the output
+            out="list-objects with prefix is dir failed"
+        fi
+    fi
+
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api list-objects --bucket ${bucket_name} --prefix dir1/"
+        test_function=${function}
+        out=$($function)
+        rv=$?
+        key_name=$(echo "$out" | jq -r .Contents[0].Key)
+        if [ $rv -eq 0 ] && [ "$key_name" != "dir1/dir2/dir3/dir4/" ]; then
+            rv=1
+            # since rv is 0, command passed, but didn't return expected value. In this case set the output
+            out="list-objects with prefix is dir failed"
+        fi
+      fi
+
+    # put dir1/dir2/  listobject(prefix=dir2/) should return "dir1/dir2/"
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api put-object --bucket ${bucket_name} --key dir1/dir2/"
+        out=$($function 2>&1)
+        rv=$?
+    else
+        # if make bucket fails, $bucket_name has the error output
+        out="${bucket_name}"
+    fi
+
+    # if upload objects succeeds, list objects with existing prefix
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api list-objects --bucket ${bucket_name} --prefix dir1/"
+        test_function=${function}
+        out=$($function)
+        rv=$?
+        key_name=$(echo "$out" | jq -r .Contents[0].Key)
+        if [ $rv -eq 0 ] && [ "$key_name" != "dir1/dir2/" ]; then
+            rv=1
+            # since rv is 0, command passed, but didn't return expected value. In this case set the output
+            out="list-objects with prefix is dir failed"
+        fi
+    fi
+
+    # delete dir1/dir2/  listobject(prefix=dir1/) should return "dir2/"
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api delete-object --bucket ${bucket_name} --key dir1/dir2/"
+        out=$($function 2>&1)
+        rv=$?
+    else
+        # if make bucket fails, $bucket_name has the error output
+        out="${bucket_name}"
+    fi
+
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api list-objects --bucket ${bucket_name} --prefix dir1/"
+        test_function=${function}
+        out=$($function)
+        rv=$?
+        key_name=$(echo "$out" | jq -r .Contents[0].Key)
+        if [ $rv -eq 0 ] && [ "$key_name" != "dir1/dir2/dir3/dir4/" ]; then
+            rv=1
+            # since rv is 0, command passed, but didn't return expected value. In this case set the output
+            out="list-objects with prefix is dir failed"
+        fi
+    fi
+
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api list-objects --bucket ${bucket_name} --prefix dir1/ --delimiter /"
+        test_function=${function}
+        out=$($function)
+        rv=$?
+        key_name=$(echo "$out" | jq -r .CommonPrefixes[0].Prefix)
+        if [ $rv -eq 0 ] && [ "$key_name" != "dir1/dir2/" ]; then
+            rv=1
+            # since rv is 0, command passed, but didn't return expected value. In this case set the output
+            out="list-objects with prefix is dir failed"
+        fi
+    fi
+
+    # delete dir1/dir2/dir3/dir4/  listobject(prefix=dir1/) should return nothing
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api delete-object --bucket ${bucket_name} --key dir1/dir2/dir3/dir4/"
+        out=$($function 2>&1)
+        rv=$?
+    else
+        # if make bucket fails, $bucket_name has the error output
+        out="${bucket_name}"
+    fi
+    if [ $rv -eq 0 ]; then
+          function="${AWS} s3api list-objects --bucket ${bucket_name} --prefix dir1/"
+          test_function=${function}
+          out=$($function)
+          rv=$?
+          output=$(echo "$out")
+          if [ $rv -eq 0 ] && [ "$output" != "" ]; then
+              rv=1
+              # since rv is 0, command passed, but didn't return expected value. In this case set the output
+              out="list-objects with prefix is dir failed"
+          fi
+    fi
+
+
 
     # if upload objects succeeds, list objectsv2 with existing prefix
     if [ $rv -eq 0 ]; then
@@ -625,6 +732,89 @@ function test_multipart_upload() {
         fi
     fi
 
+
+    for key in "afile" "bfile" "bfile" "documents/report1.pdf" "documents/report2.pdf" "ebook" "photos/2021/a2.png" "photos/2021/a3.png" "photos/2022/a4.png"
+    do
+      if [ $rv -eq 0 ]; then
+        # create multipart
+        function="${AWS} s3api create-multipart-upload --bucket ${bucket_name} --key ${key}"
+        test_function=${function}
+        out=$($function)
+        rv=$?
+        upload_id=$(echo "$out" | jq -r .UploadId)
+      fi
+    done
+
+    if [ $rv -eq 0 ]; then
+      function="${AWS} s3api list-multipart-uploads --bucket ${bucket_name}"
+      test_function=${function}
+      out=$($function)
+      rv=$?
+      keys=$(echo "$out" | jq -r '.Uploads | map(.Key) | join(",")')
+      if [ $keys != "afile,bfile,bfile,documents/report1.pdf,documents/report2.pdf,ebook,photos/2021/a2.png,photos/2021/a3.png,photos/2022/a4.png" ]; then
+       rv=1
+       out="list-multipart-uploads failed"
+      fi
+    fi
+
+    if [ $rv -eq 0 ]; then
+      function="${AWS} s3api list-multipart-uploads --bucket ${bucket_name} --key-marker bfile"
+      test_function=${function}
+      out=$($function)
+      rv=$?
+      keys=$(echo "$out" | jq -r '.Uploads | map(.Key) | join(",")')
+      if [ $keys != "bfile,bfile,documents/report1.pdf,documents/report2.pdf,ebook,photos/2021/a2.png,photos/2021/a3.png,photos/2022/a4.png" ]; then
+       rv=1
+       out="list-multipart-upload failed"
+      fi
+    fi
+
+    if [ $rv -eq 0 ]; then
+      function="${AWS} s3api list-multipart-uploads --bucket ${bucket_name} --key-marker bfile --delimiter /"
+      test_function=${function}
+      out=$($function)
+      rv=$?
+      keys=$(echo "$out" | jq -r '.Uploads | map(.Key) | join(",")')
+      if [ $keys != "bfile,bfile,ebook" ]; then
+       rv=1
+       out="list-multipart-uploads failed"
+      fi
+      keys=$(echo "$out" | jq -r '.CommonPrefixes | map(.Prefix) | join(",")')
+      if [ $keys != "documents/,photos/" ]; then
+       rv=1
+       out="list-multipart-uploads failed"
+      fi
+    fi
+
+     if [ $rv -eq 0 ]; then
+        function="${AWS} s3api list-multipart-uploads --bucket ${bucket_name} --delimiter /  --max-upload 5"
+        test_function=${function}
+        out=$($function)
+        rv=$?
+        keys=$(echo "$out" | jq -r '.Uploads | map(.Key) | join(",")')
+        if [ $keys != "afile,bfile,bfile,ebook" ]; then
+         rv=1
+         out="list-multipart-uploads failed"
+        fi
+        keys=$(echo "$out" | jq -r '.CommonPrefixes[0].Prefix')
+        if [ $keys != "documents/" ]; then
+         rv=1
+         out="list-multipart-uploads failed"
+        fi
+     fi
+
+    if [ $rv -eq 0 ]; then
+      function="${AWS} s3api list-multipart-uploads --bucket ${bucket_name} --prefix documents/"
+      test_function=${function}
+      out=$($function)
+      rv=$?
+      keys=$(echo "$out" | jq -r '.Uploads | map(.Key) | join(",")')
+        if [ $keys != "documents/report1.pdf,documents/report2.pdf" ]; then
+         rv=1
+         out="list-multipart-upload failed"
+        fi
+    fi
+
     if [ $rv -eq 0 ]; then
         function="delete_bucket"
         out=$(delete_bucket "$bucket_name")
@@ -725,6 +915,19 @@ function test_copy_object() {
     # copy object server side
     if [ $rv -eq 0 ]; then
         function="${AWS} s3api copy-object --bucket ${bucket_name} --key datafile-1-kB-copy --copy-source ${bucket_name}/datafile-1-kB"
+        test_function=${function}
+        out=$($function)
+        rv=$?
+        hash2=$(echo "$out" | jq -r .CopyObjectResult.ETag | sed -e 's/^"//' -e 's/"$//')
+        if [ $rv -eq 0 ] && [ "$HASH_1_KB" != "$hash2" ]; then
+            # Verification failed
+            rv=1
+            out="Hash mismatch expected $HASH_1_KB, got $hash2"
+        fi
+    fi
+
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api copy-object --bucket ${bucket_name} --key /not-exist-dir/datafile-1-kB-copy --copy-source ${bucket_name}/datafile-1-kB"
         test_function=${function}
         out=$($function)
         rv=$?
@@ -1199,7 +1402,7 @@ function test_list_objects_error() {
         test_function=${function}
         out=$($function 2>&1)
         rv=$?
-        if [ $rv -ne $errno ]; then
+        if [ $rv -ne 255 ] && [ $rv -ne 254 ]; then
             rv=1
         else
             rv=0
@@ -1212,7 +1415,7 @@ function test_list_objects_error() {
         test_function=${function}
         out=$($function 2>&1)
         rv=$?
-        if [ $rv -ne $errno ]; then
+        if [ $rv -ne 255 ] && [ $rv -ne 254 ]; then
             rv=1
         else
             rv=0
@@ -1260,7 +1463,7 @@ function test_put_object_error() {
         test_function=${function}
         out=$($function 2>&1)
         rv=$?
-        if [ $rv -ne $errno ]; then
+        if [ $rv -ne 255 ] && [ $rv -ne 254 ]; then
             rv=1
         else
             rv=0
@@ -1273,7 +1476,7 @@ function test_put_object_error() {
         test_function=${function}
         out=$($function 2>&1)
         rv=$?
-        if [ $rv -ne $errno ]; then
+        if [ $rv -ne 255 ] && [ $rv -ne 254 ]; then
             rv=1
         else
             rv=0
@@ -1517,7 +1720,7 @@ function test_serverside_encryption_multipart_copy() {
         test_function=${function}
         out=$($function)
         rv=$?
-        if [ $rv -ne $errno ]; then
+        if [ $rv -ne 255 ] && [ $rv -ne 254 ]; then
             rv=1
         else
             rv=0
@@ -1601,7 +1804,7 @@ function test_serverside_encryption_error() {
         rv=$?
     fi
 
-    if [ $rv -ne $errno ]; then
+    if [ $rv -ne 255 ] && [ $rv -ne 254 ]; then
         rv=1
     else
         rv=0
@@ -1614,7 +1817,7 @@ function test_serverside_encryption_error() {
         rv=$?
     fi
 
-    if [ $rv -ne $errno ]; then
+    if [ $rv -ne 255 ] && [ $rv -ne 254 ]; then
         rv=1
     else
         rv=0
@@ -1635,7 +1838,7 @@ function test_serverside_encryption_error() {
         out=$($function 2>&1)
         rv=$?
     fi
-    if [ $rv -ne $errno ]; then
+    if [ $rv -ne 255 ] && [ $rv -ne 254 ]; then
         rv=1
     else
         rv=0
@@ -1668,7 +1871,7 @@ function test_get_object_error(){
 
     # if make bucket succeeds upload a file
     if [ $rv -eq 0 ]; then
-        function="${AWS} s3api put-object --body ${MINT_DATA_DIR}/datafile-1-kB --bucket ${bucket_name} --key datafile-1-kB"
+        function="${AWS} s3api put-object --body ${MINT_DATA_DIR}/datafile-1-kB --bucket ${bucket_name} --key /dir1/datafile-1-kB"
         out=$($function 2>&1)
         rv=$?
     else
@@ -1677,23 +1880,289 @@ function test_get_object_error(){
     fi
 
     # if upload succeeds download the file
-        if [ $rv -eq 0 ]; then
-            function="${AWS} s3api get-object --bucket ${bucket_name} --key datafile-1-kB/ /tmp/datafile-1-kB"
-            # save the ref to function being tested, so it can be logged
-            test_function=${function}
-            out=$($function 2>&1)
-            if [ $? -eq $errno ];then
-                rv=0
-            fi
-            if ! [[ "$out" =~ "The specified key does not exist" ]];then
-                log_failure "$(get_duration "$start_time")" "${function}" "${out}"
-                rv=1
-            fi
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api get-object --bucket ${bucket_name} --key /dir1 /tmp/datafile-1-kB"
+        # save the ref to function being tested, so it can be logged
+        test_function=${function}
+        out=$($function 2>&1)
+        if [ $? -eq 255 ] || [ $? -eq 254 ];then
+            rv=0
         fi
+        if ! [[ "$out" =~ "The specified key does not exist" ]];then
+            log_failure "$(get_duration "$start_time")" "${function}" "${out}"
+            rv=1
+        fi
+    fi
+
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api get-object --bucket ${bucket_name} --key /dir1/ /tmp/datafile-1-kB"
+        # save the ref to function being tested, so it can be logged
+        test_function=${function}
+        out=$($function 2>&1)
+        if [ $? -eq 255 ] || [ $? -eq 254 ];then
+            rv=0
+        fi
+        if ! [[ "$out" =~ "The specified key does not exist" ]];then
+            log_failure "$(get_duration "$start_time")" "${function}" "${out}"
+            rv=1
+        fi
+    fi
+
+    # delete bucket
+    if [ $rv -eq 0 ]; then
+        function="delete_bucket"
+        out=$(delete_bucket "$bucket_name")
+        rv=$?
+    fi
     return $rv
 }
 
+function test_object_tagging(){
+    # log start time
+    start_time=$(get_time)
+    function="make_bucket"
+    bucket_name=$(make_bucket)
+    rv=$?
 
+    # put object with object tagging
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api put-object --body ${MINT_DATA_DIR}/datafile-1-kB --bucket ${bucket_name} --key /datafile-1-kB --tagging k1=v1&k2=v2"
+        out=$($function 2>&1)
+        rv=$?
+    else
+        # if make bucket fails, $bucket_name has the error output
+        out="${bucket_name}"
+    fi
+
+    # check object tagging
+    if [ $rv -eq 0 ]; then
+      function="${AWS} s3api get-object-tagging  --bucket ${bucket_name} --key /datafile-1-kB"
+      out=$($function 2>&1)
+      rv=$?
+    fi
+    if [ $rv -eq 0 ]; then
+      tagSet=$(echo "$out" | jq -r .TagSet | jq 'sort_by(.Key)' | jq -c)
+      if [ "$tagSet" != '[{"Key":"k1","Value":"v1"},{"Key":"k2","Value":"v2"}]' ]; then
+            log_failure "$(get_duration "$start_time")" "${function}" "${out}"
+            rv=1
+      fi
+    fi
+
+    # overwrite object tagging
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api put-object --body ${MINT_DATA_DIR}/datafile-1-kB --bucket ${bucket_name} --key /datafile-1-kB --tagging key1=value1&key2=value2"
+        out=$($function 2>&1)
+        rv=$?
+    else
+        # if make bucket fails, $bucket_name has the error output
+        out="${bucket_name}"
+    fi
+
+    # check object tagging
+    if [ $rv -eq 0 ]; then
+      function="${AWS} s3api get-object-tagging  --bucket ${bucket_name} --key /datafile-1-kB"
+      out=$($function 2>&1)
+      rv=$?
+    fi
+    if [ $rv -eq 0 ]; then
+      tagSet=$(echo "$out" | jq -r .TagSet | jq 'sort_by(.Key)' | jq -c)
+      if [ "$tagSet" != '[{"Key":"key1","Value":"value1"},{"Key":"key2","Value":"value2"}]' ]; then
+            log_failure "$(get_duration "$start_time")" "${function}" "${out}"
+            rv=1
+      fi
+    fi
+
+    # delete object tagging
+    if [ $rv -eq 0 ]; then
+      function="${AWS} s3api delete-object-tagging  --bucket ${bucket_name} --key /datafile-1-kB"
+      out=$($function 2>&1)
+      rv=$?
+    fi
+    # check object tagging
+    if [ $rv -eq 0 ]; then
+      tagSet=$(echo "$out" | jq -r .TagSet | jq -c)
+      if [ "$tagSet" != '' ]; then
+            log_failure "$(get_duration "$start_time")" "${function}" "${out}"
+            rv=1
+      fi
+    fi
+
+    # create multipart upload with object tagging
+    if [ $rv -eq 0 ]; then
+      function="${AWS} s3api create-multipart-upload  --bucket ${bucket_name} --key /datafile-1-kB --tagging k1=v1&k2=v2"
+      out=$($function)
+      rv=$?
+      upload_id=$(echo "$out" | jq -r .UploadId)
+    fi
+    # upload part
+    if [ $rv -eq 0 ]; then
+        # Capture etag for part-number 1
+        function="${AWS} s3api upload-part --bucket ${bucket_name} --key /datafile-1-kB --body ${MINT_DATA_DIR}/datafile-5243880-b --upload-id ${upload_id} --part-number 1"
+        out=$($function)
+        rv=$?
+        etag1=$(echo "$out" | jq -r .ETag)
+    fi
+
+    if [ $rv -eq 0 ]; then
+        # Capture etag for part-number 2
+        function="${AWS} s3api upload-part --bucket ${bucket_name} --key /datafile-1-kB --body ${MINT_DATA_DIR}/datafile-5243880-b --upload-id ${upload_id} --part-number 2"
+        out=$($function)
+        rv=$?
+        etag2=$(echo "$out" | jq -r .ETag)
+        # Create a multipart struct file for completing multipart transaction
+        echo "{
+            \"Parts\": [
+                {
+                    \"ETag\": ${etag1},
+                    \"PartNumber\": 1
+                },
+                {
+                    \"ETag\": ${etag2},
+                    \"PartNumber\": 2
+                }
+            ]
+        }" > /tmp/multipart
+    fi
+
+    # complete multipart upload
+    if [ $rv -eq 0 ]; then
+        # Use saved etags to complete the multipart transaction
+        function="${AWS} s3api complete-multipart-upload --multipart-upload file:///tmp/multipart --bucket ${bucket_name} --key /datafile-1-kB --upload-id ${upload_id}"
+        out=$($function)
+        rm -rf /tmp/multipart
+        rv=$?
+        finalETag=$(echo "$out" | jq -r .ETag | sed -e 's/^"//' -e 's/"$//')
+        if [ "${finalETag}" == "" ]; then
+            rv=1
+            out="complete-multipart-upload failed"
+        fi
+    fi
+    # check object tagging
+    if [ $rv -eq 0 ]; then
+          function="${AWS} s3api get-object-tagging  --bucket ${bucket_name} --key /datafile-1-kB"
+          out=$($function 2>&1)
+          rv=$?
+    fi
+    if [ $rv -eq 0 ]; then
+      tagSet=$(echo "$out" | jq -r .TagSet | jq 'sort_by(.Key)' | jq -c)
+      if [ "$tagSet" != '[{"Key":"k1","Value":"v1"},{"Key":"k2","Value":"v2"}]' ]; then
+            log_failure "$(get_duration "$start_time")" "${function}" "${out}"
+            rv=1
+      fi
+    fi
+
+    # overwrite object
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api put-object --body ${MINT_DATA_DIR}/datafile-1-kB --bucket ${bucket_name} --key /datafile-1-kB"
+        out=$($function 2>&1)
+        rv=$?
+    else
+        # if make bucket fails, $bucket_name has the error output
+        out="${bucket_name}"
+    fi
+
+    # check object tagging
+    if [ $rv -eq 0 ]; then
+      function="${AWS} s3api get-object-tagging  --bucket ${bucket_name} --key /datafile-1-kB"
+      out=$($function 2>&1)
+      rv=$?
+    fi
+    # check object tagging
+    if [ $rv -eq 0 ]; then
+      tagSet=$(echo "$out" | jq -r .TagSet | jq -c)
+      if [ "$tagSet" != "[]" ]; then
+            log_failure "$(get_duration "$start_time")" "${function}" "${out}"
+            rv=1
+      fi
+    fi
+
+
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api put-object --body ${MINT_DATA_DIR}/datafile-1-kB --bucket ${bucket_name} --key /datafile-1-kB --tagging key1=value1&key2=value2"
+        out=$($function 2>&1)
+        rv=$?
+    else
+        # if make bucket fails, $bucket_name has the error output
+        out="${bucket_name}"
+    fi
+
+    # check object tagging
+    if [ $rv -eq 0 ]; then
+      function="${AWS} s3api get-object-tagging  --bucket ${bucket_name} --key /datafile-1-kB"
+      out=$($function 2>&1)
+      rv=$?
+    fi
+    if [ $rv -eq 0 ]; then
+      tagSet=$(echo "$out" | jq -r .TagSet | jq 'sort_by(.Key)' | jq -c)
+      if [ "$tagSet" != '[{"Key":"key1","Value":"value1"},{"Key":"key2","Value":"value2"}]' ]; then
+            log_failure "$(get_duration "$start_time")" "${function}" "${out}"
+            rv=1
+      fi
+    fi
+
+    # copy object with tagging-directive COPY
+     if [ $rv -eq 0 ]; then
+         function="${AWS} s3api copy-object --bucket ${bucket_name} --key datafile-1-kB-copy --copy-source ${bucket_name}/datafile-1-kB"
+         out=$($function)
+         rv=$?
+         hash2=$(echo "$out" | jq -r .CopyObjectResult.ETag | sed -e 's/^"//' -e 's/"$//')
+         if [ $rv -eq 0 ] && [ "$HASH_1_KB" != "$hash2" ]; then
+             # Verification failed
+             rv=1
+             out="Hash mismatch expected $HASH_1_KB, got $hash2"
+         fi
+     fi
+
+    # check object tagging
+    if [ $rv -eq 0 ]; then
+      function="${AWS} s3api get-object-tagging  --bucket ${bucket_name} --key /datafile-1-kB-copy"
+      out=$($function 2>&1)
+      rv=$?
+    fi
+    if [ $rv -eq 0 ]; then
+      tagSet=$(echo "$out" | jq -r .TagSet | jq 'sort_by(.Key)' | jq -c)
+      if [ "$tagSet" != '[{"Key":"key1","Value":"value1"},{"Key":"key2","Value":"value2"}]' ]; then
+            log_failure "$(get_duration "$start_time")" "${function}" "${out}"
+            rv=1
+      fi
+    fi
+
+
+    # copy object with tagging-directive REPLACE
+    if [ $rv -eq 0 ]; then
+       function="${AWS} s3api copy-object --bucket ${bucket_name} --key datafile-1-kB-copy --copy-source ${bucket_name}/datafile-1-kB --tagging key=value  --tagging-directive REPLACE"
+       out=$($function)
+       rv=$?
+       hash2=$(echo "$out" | jq -r .CopyObjectResult.ETag | sed -e 's/^"//' -e 's/"$//')
+       if [ $rv -eq 0 ] && [ "$HASH_1_KB" != "$hash2" ]; then
+           # Verification failed
+           rv=1
+           out="Hash mismatch expected $HASH_1_KB, got $hash2"
+       fi
+   fi
+
+    # check object tagging
+    if [ $rv -eq 0 ]; then
+      function="${AWS} s3api get-object-tagging  --bucket ${bucket_name} --key datafile-1-kB-copy"
+      out=$($function 2>&1)
+      rv=$?
+    fi
+    if [ $rv -eq 0 ]; then
+      tagSet=$(echo "$out" | jq -r .TagSet | jq 'sort_by(.Key)' | jq -c)
+      if [ "$tagSet" != '[{"Key":"key","Value":"value"}]' ]; then
+            log_failure "$(get_duration "$start_time")" "${function}" "${out}"
+            rv=1
+      fi
+    fi
+
+    # delete bucket
+    if [ $rv -eq 0 ]; then
+        function="delete_bucket"
+        out=$(delete_bucket "$bucket_name")
+        rv=$?
+    fi
+    return $rv
+}
 # main handler for all the tests.
 main() {
     # Success tests
@@ -1724,8 +2193,8 @@ main() {
     test_serverside_encryption_error && \
     # test_worm_bucket && \
     # test_legal_hold
-    test_get_object_error
-
+    test_get_object_error &&  \
+    test_object_tagging
     return $?
 }
 

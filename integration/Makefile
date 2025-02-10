@@ -1,6 +1,6 @@
 DURATION ?= 10
 
-all: xattrs fsx s3test webdav
+all: xattrs fsx s3test webdav ioctl
 
 
 xattrs:
@@ -23,8 +23,11 @@ secfs.test:
 	make -C secfs.test >secfs.test-build-integration.log 2>&1
 
 s3test:
-	pip install awscli --upgrade
+	pip install awscli==1.27.153
 	bash s3gateway_test.sh
 
 webdav:
-	cd /home/travis/.m2/litmus-0.13 ; for i in "basic" "copymove" "http"; do sudo ./$${i} http://127.0.0.1:9009 ; done
+	cd /home/travis/.m2/litmus-0.13 ; for i in "basic" "copymove" "http"; do sudo ./$${i} http://127.0.0.1:9009 root 1234; done
+
+ioctl:
+	bash ioctl_test.sh /tmp/jfs-unit-test/ioctl_test 2>/dev/null

@@ -22,7 +22,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/mattn/go-isatty"
 	"github.com/sirupsen/logrus"
 )
 
@@ -35,6 +34,8 @@ type logHandle struct {
 	logrus.Logger
 
 	name     string
+	logid    string
+	pid      int
 	lvl      *logrus.Level
 	colorful bool
 }
@@ -60,13 +61,14 @@ func (l *logHandle) Format(e *logrus.Entry) ([]byte, error) {
 		lvlStr = fmt.Sprintf("\033[1;%dm%s\033[0m", color, lvlStr)
 	}
 	const timeFormat = "2006/01/02 15:04:05.000000"
-	timestamp := e.Time.Format(timeFormat)
-	str := fmt.Sprintf("%v %s[%d] <%v>: %v [%s:%d]",
-		timestamp,
+	str := fmt.Sprintf("%s%v %s[%d] <%v>: %v [%s@%s:%d]",
+		l.logid,
+		e.Time.Format(timeFormat),
 		l.name,
-		os.Getpid(),
+		l.pid,
 		lvlStr,
 		strings.TrimRight(e.Message, "\n"),
+		methodName(e.Caller.Function),
 		path.Base(e.Caller.File),
 		e.Caller.Line)
 
@@ -79,16 +81,44 @@ func (l *logHandle) Format(e *logrus.Entry) ([]byte, error) {
 	return []byte(str), nil
 }
 
+// Returns a human-readable method name, removing internal markers added by Go
+func methodName(fullFuncName string) string {
+	firstSlash := strings.Index(fullFuncName, "/")
+	if firstSlash != -1 && firstSlash < len(fullFuncName)-1 {
+		fullFuncName = fullFuncName[firstSlash+1:]
+	}
+	lastDot := strings.LastIndex(fullFuncName, ".")
+	if lastDot == -1 || lastDot == len(fullFuncName)-1 {
+		return fullFuncName
+	}
+	method := fullFuncName[lastDot+1:]
+	// avoid func1
+	if strings.HasPrefix(method, "func") && method[4] >= '0' && method[4] <= '9' {
+		candidate := methodName(fullFuncName[:lastDot])
+		if candidate != "" {
+			method = candidate
+		}
+	}
+	// aoid init.3
+	if len(method) == 1 && method[0] >= '0' && method[0] <= '9' {
+		candidate := methodName(fullFuncName[:lastDot])
+		if candidate != "" {
+			method = candidate
+		}
+	}
+	return method
+}
+
 // for aws.Logger
 func (l *logHandle) Log(args ...interface{}) {
 	l.Debugln(args...)
 }
 
 func newLogger(name string) *logHandle {
-	l := &logHandle{Logger: *logrus.New(), name: name, colorful: isatty.IsTerminal(os.Stderr.Fd())}
+	l := &logHandle{Logger: *logrus.New(), name: name, pid: os.Getpid(), colorful: SupportANSIColor(os.Stderr.Fd())}
 	l.Formatter = l
 	if syslogHook != nil {
-		l.Hooks.Add(syslogHook)
+		l.AddHook(syslogHook)
 	}
 	l.SetReportCaller(true)
 	return l
@@ -109,12 +139,16 @@ func GetLogger(name string) *logHandle {
 
 // SetLogLevel sets Level to all the loggers in the map
 func SetLogLevel(lvl logrus.Level) {
+	mu.Lock()
+	defer mu.Unlock()
 	for _, logger := range loggers {
 		logger.Level = lvl
 	}
 }
 
 func DisableLogColor() {
+	mu.Lock()
+	defer mu.Unlock()
 	for _, logger := range loggers {
 		logger.colorful = false
 	}
@@ -125,6 +159,8 @@ func SetOutFile(name string) {
 	if err != nil {
 		return
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	for _, logger := range loggers {
 		logger.SetOutput(file)
 		logger.colorful = false
@@ -132,7 +168,17 @@ func SetOutFile(name string) {
 }
 
 func SetOutput(w io.Writer) {
+	mu.Lock()
+	defer mu.Unlock()
 	for _, logger := range loggers {
 		logger.SetOutput(w)
+	}
+}
+
+func SetLogID(id string) {
+	mu.Lock()
+	defer mu.Unlock()
+	for _, logger := range loggers {
+		logger.logid = id
 	}
 }

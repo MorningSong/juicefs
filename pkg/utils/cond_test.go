@@ -25,35 +25,43 @@ import (
 func TestCond(t *testing.T) {
 	// test Wait and Signal
 	var m sync.Mutex
-	l := NewCond(&m)
-	done := make(chan bool)
-	var wg sync.WaitGroup
-	wg.Add(1)
+	c := NewCond(&m)
+	var ready bool
+	start := time.Now()
 	go func() {
-		m.Lock()
-		wg.Done()
-		l.Wait()
-		l.Signal()
-		m.Unlock()
-		done <- true
+		for i := 0; i < 10; i++ {
+			m.Lock()
+			ready = true
+			c.Signal()
+			for ready {
+				c.WaitWithTimeout(time.Millisecond * 100)
+			}
+			m.Unlock()
+		}
 	}()
-	wg.Wait()
-	m.Lock()
-	l.Signal()
-	l.Wait()
-	m.Unlock()
-	select {
-	case <-done:
-	case <-time.NewTimer(time.Second).C:
-		t.Fatalf("the other goroutine did not return after 1 second")
+	for i := 0; i < 10; i++ {
+		m.Lock()
+		for !ready {
+			c.WaitWithTimeout(time.Millisecond * 100)
+		}
+		ready = false
+		c.Signal()
+		m.Unlock()
+	}
+	if ready {
+		t.Fatalf("the work should finish with ready = false")
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("the work should finish in 1 second")
 	}
 
 	// test WaitWithTimeout
+	done := make(chan bool)
 	var timeout bool
 	go func() {
 		m.Lock()
 		defer m.Unlock()
-		timeout = l.WaitWithTimeout(time.Millisecond * 10)
+		timeout = c.WaitWithTimeout(time.Millisecond * 10)
 		done <- true
 	}()
 	select {
@@ -74,14 +82,14 @@ func TestCond(t *testing.T) {
 		go func() {
 			m.Lock()
 			wg2.Done()
-			timeout := l.WaitWithTimeout(time.Second)
+			timeout := c.WaitWithTimeout(time.Second)
 			m.Unlock()
 			done2 <- timeout
 		}()
 	}
 	wg2.Wait()
 	m.Lock()
-	l.Broadcast()
+	c.Broadcast()
 	m.Unlock()
 	deadline := time.NewTimer(time.Millisecond * 500)
 	for i := 0; i < N; i++ {

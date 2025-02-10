@@ -23,6 +23,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/stretchr/testify/require"
 )
 
 func writeSmallBlocks(mountDir string) error {
@@ -65,7 +68,7 @@ func getFileCount(dir string) int {
 
 func TestGc(t *testing.T) {
 	var bucket string
-	mountTemp(t, &bucket, []string{"--trash-days=0"}, nil)
+	mountTemp(t, &bucket, []string{"--trash-days=0", "--hash-prefix"}, nil)
 	defer umountTemp(t)
 
 	if err := writeSmallBlocks(testMountPoint); err != nil {
@@ -88,6 +91,8 @@ func TestGc(t *testing.T) {
 		}
 	}
 
+	os.Setenv("JFS_GC_SKIPPEDTIME", "0")
+	defer os.Unsetenv("JFS_GC_SKIPPEDTIME")
 	t.Logf("JFS_GC_SKIPPEDTIME is %s", os.Getenv("JFS_GC_SKIPPEDTIME"))
 
 	leaked := filepath.Join(dataDir, "0", "0", "123456789_0_1048576")
@@ -98,9 +103,7 @@ func TestGc(t *testing.T) {
 		t.Fatalf("gc delete failed: %s", err)
 	}
 
-	if _, err := os.Stat(leaked); err == nil {
-		t.Fatalf("gc delete didn't delete the leaked data")
-	}
+	require.False(t, utils.Exists(leaked))
 
 	if err := Main([]string{"", "gc", testMeta}); err != nil {
 		t.Fatalf("gc failed: %s", err)

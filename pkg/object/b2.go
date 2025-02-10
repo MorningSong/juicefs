@@ -33,8 +33,7 @@ import (
 
 type b2client struct {
 	DefaultObjectStorage
-	bucket     *backblaze.Bucket
-	nextMarker string
+	bucket *backblaze.Bucket
 }
 
 func (c *b2client) String() string {
@@ -46,11 +45,17 @@ func (c *b2client) Create() error {
 }
 
 func (c *b2client) getFileInfo(key string) (*backblaze.File, error) {
-	f, r, err := c.bucket.DownloadFileRangeByName(key, &backblaze.FileRange{Start: 0, End: 1})
+	var f *backblaze.File
+	var r io.ReadCloser
+	var err error
+	f, r, err = c.bucket.DownloadFileRangeByName(key, &backblaze.FileRange{Start: 0, End: 1})
 	if err != nil {
-		if e, ok := err.(backblaze.B2Error); ok && e.Status == http.StatusNotFound {
-			err = os.ErrNotExist
+		//	get empty file info
+		if e, ok := err.(*backblaze.B2Error); ok && e.Status == http.StatusRequestedRangeNotSatisfiable {
+			f, r, err = c.bucket.DownloadFileRangeByName(key, nil)
 		}
+	}
+	if err != nil {
 		return nil, err
 	}
 	var buf [2]byte
@@ -72,10 +77,11 @@ func (c *b2client) Head(key string) (Object, error) {
 		f.ContentLength,
 		time.Unix(f.UploadTimestamp/1000, 0),
 		strings.HasSuffix(f.Name, "/"),
+		"",
 	}, nil
 }
 
-func (c *b2client) Get(key string, off, limit int64) (io.ReadCloser, error) {
+func (c *b2client) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
 	if off == 0 && limit == -1 {
 		_, r, err := c.bucket.DownloadFileByName(key)
 		return r, err
@@ -88,7 +94,7 @@ func (c *b2client) Get(key string, off, limit int64) (io.ReadCloser, error) {
 	return r, err
 }
 
-func (c *b2client) Put(key string, data io.Reader) error {
+func (c *b2client) Put(key string, data io.Reader, getters ...AttrGetter) error {
 	_, err := c.bucket.UploadFile(key, nil, data)
 	return err
 }
@@ -98,11 +104,12 @@ func (c *b2client) Copy(dst, src string) error {
 	if err != nil {
 		return err
 	}
-	_, err = c.bucket.CopyFile(f.ID, dst, "", backblaze.FileMetaDirectiveCopy)
+	// destinationBucketId must be set,otherwise it will return 400 Bad destinationBucketId
+	_, err = c.bucket.CopyFile(f.ID, dst, c.bucket.ID, backblaze.FileMetaDirectiveCopy)
 	return err
 }
 
-func (c *b2client) Delete(key string) error {
+func (c *b2client) Delete(key string, getters ...AttrGetter) error {
 	f, err := c.getFileInfo(key)
 	if err != nil {
 		if strings.HasPrefix(err.Error(), "not_found") {
@@ -114,32 +121,32 @@ func (c *b2client) Delete(key string) error {
 	return err
 }
 
-func (c *b2client) List(prefix, marker string, limit int64) ([]Object, error) {
+func (c *b2client) List(prefix, startAfter, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
 	if limit > 1000 {
 		limit = 1000
 	}
-	if marker == "" && c.nextMarker != "" {
-		marker = c.nextMarker
-		c.nextMarker = ""
-	}
-	resp, err := c.bucket.ListFileNamesWithPrefix(marker, int(limit), prefix, "")
+
+	resp, err := c.bucket.ListFileNamesWithPrefix(startAfter, int(limit), prefix, delimiter)
 	if err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
 
 	n := len(resp.Files)
-	objs := make([]Object, n)
+	objs := make([]Object, 0, n)
 	for i := 0; i < n; i++ {
+		if resp.Files[i].Name <= startAfter {
+			continue
+		}
 		f := resp.Files[i]
-		objs[i] = &obj{
+		objs = append(objs, &obj{
 			f.Name,
 			f.ContentLength,
 			time.Unix(f.UploadTimestamp/1000, 0),
 			strings.HasSuffix(f.Name, "/"),
-		}
+			"",
+		})
 	}
-	c.nextMarker = resp.NextFileName
-	return objs, nil
+	return objs, resp.NextFileName != "", resp.NextFileName, nil
 }
 
 // TODO: support multipart upload using S3 client
@@ -165,6 +172,8 @@ func newB2(endpoint, keyID, applicationKey, token string) (ObjectStorage, error)
 	bucket, err := client.Bucket(name)
 	if err != nil {
 		logger.Warnf("access bucket %s: %s", name, err)
+	}
+	if err == nil && bucket == nil {
 		bucket, err = client.CreateBucket(name, "allPrivate")
 		if err != nil {
 			return nil, fmt.Errorf("create bucket %s: %s", name, err)

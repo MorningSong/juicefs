@@ -28,7 +28,7 @@ var used int64
 
 // Alloc returns size bytes memory from Go heap.
 func Alloc(size int) []byte {
-	zeros := powerOf2(size)
+	zeros := PowerOf2(size)
 	b := *pools[zeros].Get().(*[]byte)
 	if cap(b) < size {
 		panic(fmt.Sprintf("%d < %d", cap(b), size))
@@ -41,7 +41,7 @@ func Alloc(size int) []byte {
 func Free(b []byte) {
 	// buf could be zero length
 	atomic.AddInt64(&used, -int64(cap(b)))
-	pools[powerOf2(cap(b))].Put(&b)
+	pools[PowerOf2(cap(b))].Put(&b)
 }
 
 // AllocMemory returns the allocated memory
@@ -51,7 +51,7 @@ func AllocMemory() int64 {
 
 var pools []*sync.Pool
 
-func powerOf2(s int) int {
+func PowerOf2(s int) int {
 	var bits int
 	var p int = 1
 	for p < s {
@@ -62,8 +62,8 @@ func powerOf2(s int) int {
 }
 
 func init() {
-	pools = make([]*sync.Pool, 30) // 1 - 1G
-	for i := 0; i < 30; i++ {
+	pools = make([]*sync.Pool, 33) // 1 - 8G
+	for i := 0; i < 33; i++ {
 		func(bits int) {
 			pools[i] = &sync.Pool{
 				New: func() interface{} {

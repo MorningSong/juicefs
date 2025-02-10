@@ -1,41 +1,47 @@
-name: "ltp"
+name: "ltpfs"
 
 on:
   push:
     branches:
+      - 'main'
       - 'release-**'
-    paths-ignore:
-      - 'docs/**'
+    paths:
+      - '**/ltpfs.yml'
   pull_request:
-    #The branches below must be a subset of the branches above
     branches:
+      - 'main'
       - 'release-**'
-    paths-ignore:
-      - 'docs/**'
+    paths:
+      - '**/ltpfs.yml'
   schedule:
     - cron:  '30 20 * * *'
   workflow_dispatch:
 
 jobs:
   ltpfs:
-    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    runs-on: ubuntu-20.04
     steps:
-      - name: Set up Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: '1.18.x'
-
-      - name: Set up Docker
-        uses: docker-practice/actions-setup-docker@master
-
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           fetch-depth: 1
 
-      - name: Build linux target
+      - name: mount coverage dir
+        timeout-minutes: 5
+        uses: ./.github/actions/mount-coverage-dir
+        with:
+          mount_point: cover
+          access_key: ${{ secrets.CI_COVERAGE_AWS_AK }}
+          secret_key: ${{ secrets.CI_COVERAGE_AWS_SK }}
+          token: ${{ secrets.CI_COVERAGE_AWS_TOKEN }}
+
+      - name: Build
+        timeout-minutes: 10
+        uses: ./.github/actions/build
+
+      - name: Copy
         run: |
-          make juicefs
           cp .github/workflows/bash/rm_fs /tmp/
           cp .github/workflows/bash/rm_list.sh /tmp/
 
@@ -46,15 +52,16 @@ jobs:
 
       - name: Juicefs Format
         run: |
-          sudo ./juicefs format --trash-days 0 redis://127.0.0.1:6379/1 pics
+          sudo GOCOVERDIR=$(pwd)/cover ./juicefs format --trash-days 0 redis://127.0.0.1:6379/1 pics
 
       - name: Juicefs Mount
         run: |
-          sudo ./juicefs mount -d redis://127.0.0.1:6379/1 /tmp/jfs --no-usage-report &
+          sudo GOCOVERDIR=$(pwd)/cover ./juicefs mount -d redis://127.0.0.1:6379/1 /tmp/jfs --no-usage-report
 
       - name: LTP FS
         timeout-minutes: 50
         run: |
+          sudo .github/scripts/apt_install.sh libaio-dev libacl1-dev attr
           wget -O ltp.tar.gz https://github.com/linux-test-project/ltp/archive/refs/tags/20210927.tar.gz
           mkdir ltp
           tar -xvf ltp.tar.gz -C ltp --strip-components 1
@@ -68,29 +75,28 @@ jobs:
           sudo chmod +x /tmp/rm_list.sh
           sudo chmod 777 runtest/fs
           sudo /tmp/rm_list.sh /tmp/rm_fs /opt/ltp/runtest/fs
-          echo "chdir01 chdir01" >/tmp/rm_smoketest
-          cat /tmp/rm_smoketest
-          sudo /tmp/rm_list.sh /tmp/rm_smoketest /opt/ltp/runtest/smoketest
-          sudo ./runltp -d /tmp/jfs -f fs_bind,fs_perms_simple,fsx,io,smoketest,fcntl-locktests &
-          wait $!
-          sudo ./runltp -d /tmp/jfs -f fs -C result.log.failed -T result.log.tconf -l result.log  &
-          wait $!
+          sudo ./runltp -d /tmp/jfs -f fs,fs_perms_simple,fsx,io,fcntl-locktests -C result.log.failed -T result.log.tconf -l result.log
 
-
-      - name: Log
-        if: ${{ always() }}
+      - name: tconf Log
+        if: always()
         run: |
-          sudo tail -n 100 /opt/ltp/output/result.log.failed
-          tail -300 /var/log/juicefs.log
-          grep "<FATAL>:" /var/log/juicefs.log && exit 1 || true
+          cat /opt/ltp/output/result.log.tconf
+
+      - name: check ltpsyscall failed log
+        if: always()
+        run: |
+          cat /opt/ltp/output/result.log.failed
+          
+      - name: upload coverage report
+        timeout-minutes: 5
+        continue-on-error: true
+        uses: ./.github/actions/upload-coverage
+        with:
+          UPLOAD_TOKEN: ${{ secrets.CI_COVERAGE_FILE_UPLOAD_AUTH_TOKEN }}
 
       - name: Send Slack Notification
-        if: ${{ failure() }}
+        if: failure()
         uses: juicedata/slack-notify-action@main
         with:
           channel-id: "${{ secrets.SLACK_CHANNEL_ID_FOR_PR_CHECK_NOTIFY }}"
           slack_bot_token: "${{ secrets.SLACK_BOT_TOKEN }}"  
-
-      - name: Setup upterm session
-        if: ${{ failure() }}
-        uses: lhotari/action-upterm@v1

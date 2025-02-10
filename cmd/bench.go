@@ -18,7 +18,6 @@ package cmd
 
 import (
 	"fmt"
-	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,8 +27,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/juicedata/juicefs/pkg/utils"
-	"github.com/mattn/go-isatty"
 	"github.com/urfave/cli/v2"
 )
 
@@ -54,19 +53,19 @@ $ juicefs bench /mnt/jfs --big-file-size 0
 
 Details: https://juicefs.com/docs/community/performance_evaluation_guide#juicefs-bench`,
 		Flags: []cli.Flag{
-			&cli.UintFlag{
+			&cli.StringFlag{
 				Name:  "block-size",
-				Value: 1,
+				Value: "1M",
 				Usage: "size of each IO block in MiB",
 			},
-			&cli.UintFlag{
+			&cli.StringFlag{
 				Name:  "big-file-size",
-				Value: 1024,
+				Value: "1G",
 				Usage: "size of each big file in MiB",
 			},
-			&cli.UintFlag{
+			&cli.StringFlag{
 				Name:  "small-file-size",
-				Value: 128,
+				Value: "128K",
 				Usage: "size of each small file in KiB",
 			},
 			&cli.UintFlag{
@@ -108,7 +107,7 @@ type benchCase struct {
 }
 
 type benchmark struct {
-	tty        bool
+	colorful   bool
 	big, small *benchCase
 	threads    int
 	tmpdir     string
@@ -116,13 +115,13 @@ type benchmark struct {
 
 func (bc *benchCase) writeFiles(index int) {
 	for i := 0; i < bc.fcount; i++ {
-		fname := fmt.Sprintf("%s/%s.%d.%d", bc.bm.tmpdir, bc.name, index, i)
+		fname := filepath.Join(bc.bm.tmpdir, fmt.Sprintf("%s.%d.%d", bc.name, index, i))
 		fp, err := os.OpenFile(fname, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 		if err != nil {
 			logger.Fatalf("Failed to open file %s: %s", fname, err)
 		}
 		buf := make([]byte, bc.bsize)
-		_, _ = rand.Read(buf)
+		utils.RandRead(buf)
 		for j := 0; j < bc.bcount; j++ {
 			if _, err = fp.Write(buf); err != nil {
 				logger.Fatalf("Failed to write file %s: %s", fname, err)
@@ -135,7 +134,7 @@ func (bc *benchCase) writeFiles(index int) {
 
 func (bc *benchCase) readFiles(index int) {
 	for i := 0; i < bc.fcount; i++ {
-		fname := fmt.Sprintf("%s/%s.%d.%d", bc.bm.tmpdir, bc.name, index, i)
+		fname := filepath.Join(bc.bm.tmpdir, fmt.Sprintf("%s.%d.%d", bc.name, index, i))
 		fp, err := os.Open(fname)
 		if err != nil {
 			logger.Fatalf("Failed to open file %s: %s", fname, err)
@@ -153,7 +152,7 @@ func (bc *benchCase) readFiles(index int) {
 
 func (bc *benchCase) statFiles(index int) {
 	for i := 0; i < bc.fcount; i++ {
-		fname := fmt.Sprintf("%s/%s.%d.%d", bc.bm.tmpdir, bc.name, index, i)
+		fname := filepath.Join(bc.bm.tmpdir, fmt.Sprintf("%s.%d.%d", bc.name, index, i))
 		if _, err := os.Stat(fname); err != nil {
 			logger.Fatalf("Failed to stat file %s: %s", fname, err)
 		}
@@ -185,14 +184,13 @@ func (bc *benchCase) run(test string) float64 {
 	return time.Since(start).Seconds()
 }
 
-// blockSize, bigSize in MiB; smallSize in KiB
 func newBenchmark(tmpdir string, blockSize, bigSize, smallSize, smallCount, threads int) *benchmark {
 	bm := &benchmark{threads: threads, tmpdir: tmpdir}
 	if bigSize > 0 {
-		bm.big = bm.newCase("bigfile", bigSize<<20, 1, blockSize<<20)
+		bm.big = bm.newCase("bigfile", bigSize, 1, blockSize)
 	}
 	if smallSize > 0 && smallCount > 0 {
-		bm.small = bm.newCase("smallfile", smallSize<<10, smallCount, blockSize<<20)
+		bm.small = bm.newCase("smallfile", smallSize, smallCount, blockSize)
 	}
 	return bm
 }
@@ -218,7 +216,7 @@ func (bm *benchmark) newCase(name string, fsize, fcount, bsize int) *benchCase {
 func (bm *benchmark) colorize(item string, value, cost float64, prec int) (string, string) {
 	svalue := strconv.FormatFloat(value, 'f', prec, 64)
 	scost := strconv.FormatFloat(cost, 'f', 2, 64)
-	if bm.tty {
+	if bm.colorful {
 		r, ok := resultRange[item]
 		if !ok {
 			logger.Fatalf("Invalid item: %s", item)
@@ -248,7 +246,7 @@ func (bm *benchmark) colorize(item string, value, cost float64, prec int) (strin
 	return svalue, scost
 }
 
-func printResult(result [][]string, leftAlign int, isatty bool) {
+func printResult(result [][]string, leftAlign int, colorful bool) {
 	if len(result) < 2 {
 		logger.Fatalf("result must not be empty")
 	}
@@ -262,7 +260,7 @@ func printResult(result [][]string, leftAlign int, isatty bool) {
 		}
 	}
 	copy(max, rawmax)
-	if isatty {
+	if colorful {
 		for i := 1; i < colNum; i++ {
 			max[i] -= 11
 		}
@@ -310,16 +308,19 @@ func printResult(result [][]string, leftAlign int, isatty bool) {
 func bench(ctx *cli.Context) error {
 	setup(ctx, 1)
 	/* --- Pre-check --- */
-	if ctx.Uint("block-size") == 0 || ctx.Uint("threads") == 0 {
+	blockSize := utils.ParseBytes(ctx, "block-size", 'M')
+	if blockSize == 0 || ctx.Uint("threads") == 0 {
 		return os.ErrInvalid
 	}
 	tmpdir, err := filepath.Abs(ctx.Args().First())
 	if err != nil {
 		logger.Fatalf("Failed to get absolute path of %s: %s", ctx.Args().First(), err)
 	}
+	bigSize := utils.ParseBytes(ctx, "big-file-size", 'M')
+	smallSize := utils.ParseBytes(ctx, "small-file-size", 'K')
 	tmpdir = filepath.Join(tmpdir, fmt.Sprintf("__juicefs_benchmark_%d__", time.Now().UnixNano()))
-	bm := newBenchmark(tmpdir, int(ctx.Uint("block-size")), int(ctx.Uint("big-file-size")),
-		int(ctx.Uint("small-file-size")), int(ctx.Uint("small-file-count")), int(ctx.Uint("threads")))
+	bm := newBenchmark(tmpdir, int(blockSize), int(bigSize), int(smallSize),
+		int(ctx.Uint("small-file-count")), int(ctx.Uint("threads")))
 	if bm.big == nil && bm.small == nil {
 		return os.ErrInvalid
 	}
@@ -332,25 +333,21 @@ func bench(ctx *cli.Context) error {
 		purgeArgs = append(purgeArgs, "purge")
 	case "linux":
 		purgeArgs = append(purgeArgs, "/bin/sh", "-c", "echo 3 > /proc/sys/vm/drop_caches")
+	case "windows":
+		break
 	default:
-		logger.Fatal("Currently only support Linux/macOS")
+		logger.Fatal("Currently only support Linux/MacOS/Windows")
 	}
 
 	/* --- Prepare --- */
 	if _, err := os.Stat(bm.tmpdir); os.IsNotExist(err) {
-		if err = os.MkdirAll(bm.tmpdir, 0755); err != nil {
+		if err = os.MkdirAll(bm.tmpdir, 0777); err != nil {
 			logger.Fatalf("Failed to create %s: %s", bm.tmpdir, err)
 		}
 	}
-	var statsPath string
-	for mp := filepath.Dir(bm.tmpdir); mp != "/"; mp = filepath.Dir(mp) {
-		if _, err := os.Stat(filepath.Join(mp, ".stats")); err == nil {
-			statsPath = filepath.Join(mp, ".stats")
-			break
-		}
-	}
+	mp, _ := findMountpoint(bm.tmpdir)
 	dropCaches := func() {
-		if os.Getenv("SKIP_DROP_CACHES") != "true" {
+		if os.Getenv("SKIP_DROP_CACHES") != "true" && runtime.GOOS != "windows" {
 			if err := exec.Command(purgeArgs[0], purgeArgs[1:]...).Run(); err != nil {
 				logger.Warnf("Failed to clean kernel caches: %s", err)
 			}
@@ -362,47 +359,43 @@ func bench(ctx *cli.Context) error {
 		fmt.Println("Cleaning kernel cache, may ask for root privilege...")
 	}
 	dropCaches()
-	bm.tty = isatty.IsTerminal(os.Stdout.Fd())
-	progress := utils.NewProgress(!bm.tty, false)
-	if b := bm.big; b != nil {
-		total := int64(bm.threads * b.fcount * b.bcount)
-		b.wbar = progress.AddCountBar("Write big blocks", total)
-		b.rbar = progress.AddCountBar("Read big blocks", total)
-	}
-	if s := bm.small; s != nil {
-		total := int64(bm.threads * s.fcount * s.bcount)
-		s.wbar = progress.AddCountBar("Write small blocks", total)
-		s.rbar = progress.AddCountBar("Read small blocks", total)
-		s.sbar = progress.AddCountBar("Stat small files", int64(bm.threads*s.fcount))
-	}
-
+	bm.colorful = utils.SupportANSIColor(os.Stdout.Fd())
+	progress := utils.NewProgress(false)
 	/* --- Run Benchmark --- */
 	var stats map[string]float64
-	if statsPath != "" {
-		stats = readStats(statsPath)
+	if mp != "" {
+		stats = readStats(mp)
 	}
 	var result [][]string
 	result = append(result, []string{"ITEM", "VALUE", "COST"})
 	if b := bm.big; b != nil {
+		total := int64(bm.threads * b.fcount * b.bcount)
+		b.wbar = progress.AddCountBar("Write big blocks", total)
 		cost := b.run("write")
+		b.wbar.Done()
 		line := make([]string, 3)
 		line[0] = "Write big file"
-		line[1], line[2] = bm.colorize("bigwr", float64((b.fsize>>20)*b.fcount*bm.threads)/cost, cost/float64(b.fcount), 2)
+		line[1], line[2] = bm.colorize("bigwr", float64(b.fsize)/1024/1024*float64(b.fcount*bm.threads)/cost, cost/float64(b.fcount), 2)
 		line[1] += " MiB/s"
 		line[2] += " s/file"
 		result = append(result, line)
 		dropCaches()
 
+		b.rbar = progress.AddCountBar("Read big blocks", total)
 		cost = b.run("read")
+		b.rbar.Done()
 		line = make([]string, 3)
 		line[0] = "Read big file"
-		line[1], line[2] = bm.colorize("bigrd", float64((b.fsize>>20)*b.fcount*bm.threads)/cost, cost/float64(b.fcount), 2)
+		line[1], line[2] = bm.colorize("bigrd", float64(b.fsize)/1024/1024*float64(b.fcount*bm.threads)/cost, cost/float64(b.fcount), 2)
 		line[1] += " MiB/s"
 		line[2] += " s/file"
 		result = append(result, line)
 	}
 	if s := bm.small; s != nil {
+		total := int64(bm.threads * s.fcount * s.bcount)
+		s.wbar = progress.AddCountBar("Write small blocks", total)
 		cost := s.run("write")
+		s.wbar.Done()
 		line := make([]string, 3)
 		line[0] = "Write small file"
 		line[1], line[2] = bm.colorize("smallwr", float64(s.fcount*bm.threads)/cost, cost*1000/float64(s.fcount), 1)
@@ -411,7 +404,9 @@ func bench(ctx *cli.Context) error {
 		result = append(result, line)
 		dropCaches()
 
+		s.rbar = progress.AddCountBar("Read small blocks", total)
 		cost = s.run("read")
+		s.rbar.Done()
 		line = make([]string, 3)
 		line[0] = "Read small file"
 		line[1], line[2] = bm.colorize("smallrd", float64(s.fcount*bm.threads)/cost, cost*1000/float64(s.fcount), 1)
@@ -420,7 +415,9 @@ func bench(ctx *cli.Context) error {
 		result = append(result, line)
 		dropCaches()
 
+		s.sbar = progress.AddCountBar("Stat small files", int64(bm.threads*s.fcount))
 		cost = s.run("stat")
+		s.sbar.Done()
 		line = make([]string, 3)
 		line[0] = "Stat file"
 		line[1], line[2] = bm.colorize("stat", float64(s.fcount*bm.threads)/cost, cost*1000/float64(s.fcount), 1)
@@ -437,10 +434,11 @@ func bench(ctx *cli.Context) error {
 
 	/* --- Report --- */
 	fmt.Println("Benchmark finished!")
-	fmt.Printf("BlockSize: %d MiB, BigFileSize: %d MiB, SmallFileSize: %d KiB, SmallFileCount: %d, NumThreads: %d\n",
-		ctx.Uint("block-size"), ctx.Uint("big-file-size"), ctx.Uint("small-file-size"), ctx.Uint("small-file-count"), ctx.Uint("threads"))
+	fmt.Printf("BlockSize: %s, BigFileSize: %s, SmallFileSize: %s, SmallFileCount: %d, NumThreads: %d\n",
+		humanize.IBytes(blockSize), humanize.IBytes(bigSize), humanize.IBytes(smallSize),
+		ctx.Uint("small-file-count"), ctx.Uint("threads"))
 	if stats != nil {
-		stats2 := readStats(statsPath)
+		stats2 := readStats(mp)
 		diff := func(item string) float64 {
 			return stats2["juicefs_"+item] - stats["juicefs_"+item]
 		}
@@ -465,7 +463,7 @@ func bench(ctx *cli.Context) error {
 		show("Write into cache", "cachewr", "blockcache_write_hist_seconds")
 		show("Read from cache", "cacherd", "blockcache_read_hist_seconds")
 		var fmtString string
-		if bm.tty {
+		if bm.colorful {
 			greenSeq := fmt.Sprintf("%s%dm", COLOR_SEQ, GREEN)
 			fmtString = fmt.Sprintf("Time used: %s%%.1f%s s, CPU: %s%%.1f%s%%%%, Memory: %s%%.1f%s MiB\n",
 				greenSeq, RESET_SEQ, greenSeq, RESET_SEQ, greenSeq, RESET_SEQ)
@@ -474,6 +472,6 @@ func bench(ctx *cli.Context) error {
 		}
 		fmt.Printf(fmtString, diff("uptime"), diff("cpu_usage")*100/diff("uptime"), stats2["juicefs_memory"]/1024/1024)
 	}
-	printResult(result, -1, bm.tty)
+	printResult(result, -1, bm.colorful)
 	return nil
 }

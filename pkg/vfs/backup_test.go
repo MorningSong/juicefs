@@ -68,12 +68,12 @@ func TestRotate(t *testing.T) {
 }
 
 func TestBackup(t *testing.T) {
-	v, blob := createTestVFS()
-	go Backup(v.Meta, blob, time.Millisecond*100)
+	v, blob := createTestVFS(nil, "")
+	go Backup(v.Meta, blob, time.Millisecond*100, false)
 	time.Sleep(time.Millisecond * 100)
 
 	blob = object.WithPrefix(blob, "meta/")
-	kc, _ := osync.ListAll(blob, "", "")
+	kc, _ := osync.ListAll(blob, "", "", "", true)
 	var keys []string
 	for obj := range kc {
 		keys = append(keys, obj.Key())

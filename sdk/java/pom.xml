@@ -6,10 +6,11 @@
 	<url>https://github.com/juicedata/juicefs</url>
 	<description>Hadoop FileSystem implementation for JuiceFS</description>
 	<artifactId>juicefs-hadoop</artifactId>
-	<version>1.1-dev</version>
+	<version>1.2-dev</version>
 	<packaging>jar</packaging>
 	<properties>
 		<hadoop.version>3.1.4</hadoop.version>
+		<flink.version>1.16.3</flink.version>
 		<argLine>-Djdk.net.URLClassPath.disableClassPathURLCheck=true -Djava.library.path=${project.basedir}/../mount/libjfs:${java.library.path} -Djdk.attach.allowAttachSelf=true</argLine>
 	</properties>
 
@@ -42,6 +43,9 @@
 				<configuration>
 					<argLine>${argLine}</argLine>
 					<trimStackTrace>false</trimStackTrace>
+					<systemProperties>
+						<test.cache.data>${project.build.directory}/test-classes</test.cache.data>
+					</systemProperties>
 				</configuration>
 			</plugin>
 			<plugin>
@@ -73,6 +77,18 @@
 						<relocation>
 							<pattern>org.javassist</pattern>
 							<shadedPattern>io.juicefs.shaded.org.javassist</shadedPattern>
+						</relocation>
+						<relocation>
+							<pattern>com.google.common</pattern>
+							<shadedPattern>io.juicefs.shaded.com.google.common</shadedPattern>
+						</relocation>
+						<relocation>
+							<pattern>org.apache.commons.lang</pattern>
+							<shadedPattern>io.juicefs.shaded.org.apache.commons.lang</shadedPattern>
+						</relocation>
+						<relocation>
+							<pattern>com.kstruct.gethostname4j</pattern>
+							<shadedPattern>io.juicefs.shaded.com.kstruct.gethostname4j</shadedPattern>
 						</relocation>
 					</relocations>
 				</configuration>
@@ -181,6 +197,48 @@
 					</execution>
 				</executions>
 			</plugin>
+			<plugin>
+				<groupId>org.pitest</groupId>
+				<artifactId>pitest-maven</artifactId>
+				<version>1.9.11</version>
+				<configuration>
+					<targetClasses>
+						<param>io.juicefs.JuiceFileSystemImpl*</param>
+					</targetClasses>
+					<targetTests>
+						<param>io.juicefs.JuiceFileSystemTest</param>
+					</targetTests>
+					<timeoutConstant>1000</timeoutConstant>
+					<avoidCallsTo>
+						<avoidCallsTo>org.apache.log4j</avoidCallsTo>
+						<avoidCallsTo>org.slf4j</avoidCallsTo>
+						<avoidCallsTo>org.apache.commons.logging</avoidCallsTo>
+					</avoidCallsTo>
+				</configuration>
+			</plugin>
+			<plugin>
+				<groupId>io.github.git-commit-id</groupId>
+				<artifactId>git-commit-id-maven-plugin</artifactId>
+				<version>4.9.9</version>
+				<executions>
+					<execution>
+						<id>get-the-git-infos</id>
+						<goals>
+							<goal>revision</goal>
+						</goals>
+						<phase>initialize</phase>
+					</execution>
+				</executions>
+				<configuration>
+					<generateGitPropertiesFile>true</generateGitPropertiesFile>
+					<generateGitPropertiesFilename>${project.build.outputDirectory}/juicefs-ver.properties</generateGitPropertiesFilename>
+					<includeOnlyProperties>
+						<includeOnlyProperty>^git.build.(time|version)$</includeOnlyProperty>
+						<includeOnlyProperty>^git.commit.id.(abbrev|full)$</includeOnlyProperty>
+					</includeOnlyProperties>
+					<commitIdGenerationMode>full</commitIdGenerationMode>
+				</configuration>
+			</plugin>
 		</plugins>
 		<resources>
 			<resource>
@@ -193,6 +251,9 @@
 		<testResources>
 			<testResource>
 				<directory>conf</directory>
+			</testResource>
+			<testResource>
+				<directory>src/test/resources</directory>
 			</testResource>
 		</testResources>
 	</build>
@@ -259,14 +320,19 @@
 		<dependency>
 			<groupId>org.apache.flink</groupId>
 			<artifactId>flink-hadoop-fs</artifactId>
-			<version>1.10.3</version>
+			<version>${flink.version}</version>
 			<scope>provided</scope>
 		</dependency>
 		<dependency>
 			<groupId>org.apache.flink</groupId>
 			<artifactId>flink-core</artifactId>
-			<version>1.10.3</version>
+			<version>${flink.version}</version>
 			<scope>provided</scope>
+		</dependency>
+		<dependency>
+			<groupId>com.google.guava</groupId>
+			<artifactId>guava</artifactId>
+			<version>32.0.1-jre</version>
 		</dependency>
 		<dependency>
 			<groupId>org.apache.hadoop</groupId>
@@ -276,8 +342,8 @@
 		</dependency>
 		<dependency>
 			<groupId>org.apache.flink</groupId>
-			<artifactId>flink-streaming-java_2.12</artifactId>
-			<version>1.10.0</version>
+			<artifactId>flink-streaming-java</artifactId>
+			<version>${flink.version}</version>
 			<scope>test</scope>
 		</dependency>
 		<dependency>
@@ -285,6 +351,48 @@
 			<artifactId>kite-data-core</artifactId>
 			<version>1.1.0</version>
 			<scope>provided</scope>
+			<exclusions>
+				<exclusion>
+					<groupId>*</groupId>
+					<artifactId>*</artifactId>
+				</exclusion>
+			</exclusions>
+		</dependency>
+		<dependency>
+			<groupId>commons-lang</groupId>
+			<artifactId>commons-lang</artifactId>
+			<version>2.6</version>
+		</dependency>
+		<dependency>
+			<groupId>org.apache.ranger</groupId>
+			<artifactId>ranger-plugins-common</artifactId>
+			<version>2.3.0</version>
+			<exclusions>
+				<exclusion>
+					<groupId>*</groupId>
+					<artifactId>*</artifactId>
+				</exclusion>
+			</exclusions>
+		</dependency>
+		<dependency>
+			<groupId>com.kstruct</groupId>
+			<artifactId>gethostname4j</artifactId>
+			<version>0.0.2</version>
+		</dependency>
+		<dependency>
+			<groupId>com.sun.jersey</groupId>
+			<artifactId>jersey-bundle</artifactId>
+			<version>1.19.3</version>
+		</dependency>
+		<dependency>
+			<groupId>org.codehaus.jackson</groupId>
+			<artifactId>jackson-jaxrs</artifactId>
+			<version>1.9.13</version>
+		</dependency>
+		<dependency>
+			<groupId>org.apache.ranger</groupId>
+			<artifactId>ranger-plugins-audit</artifactId>
+			<version>2.3.0</version>
 			<exclusions>
 				<exclusion>
 					<groupId>*</groupId>

@@ -39,6 +39,16 @@ func (m *minio) String() string {
 	return fmt.Sprintf("minio://%s/%s/", *m.s3client.ses.Config.Endpoint, m.s3client.bucket)
 }
 
+func (m *minio) Limits() Limits {
+	return Limits{
+		IsSupportMultipartUpload: true,
+		IsSupportUploadPartCopy:  true,
+		MinPartSize:              5 << 20,
+		MaxPartSize:              5 << 30,
+		MaxPartCount:             10000,
+	}
+}
+
 func newMinio(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {
 	if !strings.Contains(endpoint, "://") {
 		endpoint = fmt.Sprintf("http://%s", endpoint)
@@ -48,11 +58,18 @@ func newMinio(endpoint, accessKey, secretKey, token string) (ObjectStorage, erro
 		return nil, fmt.Errorf("Invalid endpoint %s: %s", endpoint, err)
 	}
 	ssl := strings.ToLower(uri.Scheme) == "https"
+	region := uri.Query().Get("region")
+	if region == "" {
+		region = os.Getenv("MINIO_REGION")
+	}
+	if region == "" {
+		region = awsDefaultRegion
+	}
 	awsConfig := &aws.Config{
-		Region:           aws.String(awsDefaultRegion),
+		Region:           aws.String(region),
 		Endpoint:         &uri.Host,
 		DisableSSL:       aws.Bool(!ssl),
-		S3ForcePathStyle: aws.Bool(true),
+		S3ForcePathStyle: aws.Bool(defaultPathStyle()),
 		HTTPClient:       httpClient,
 	}
 	if accessKey == "" {
@@ -79,7 +96,7 @@ func newMinio(endpoint, accessKey, secretKey, token string) (ObjectStorage, erro
 		bucket = bucket[len("minio/"):]
 	}
 	bucket = strings.Split(bucket, "/")[0]
-	return &minio{s3client{bucket, s3.New(ses), ses}}, nil
+	return &minio{s3client{bucket: bucket, s3: s3.New(ses), ses: ses}}, nil
 }
 
 func init() {

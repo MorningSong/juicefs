@@ -17,7 +17,6 @@
 package utils
 
 import (
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
@@ -35,6 +34,7 @@ func TestLogger(t *testing.T) {
 	SetOutFile("") // invalid
 	SetOutFile(f.Name())
 	InitLoggers(true)
+	SetLogID("testid")
 
 	SetLogLevel(logrus.TraceLevel)
 	SetLogLevel(logrus.DebugLevel)
@@ -48,11 +48,49 @@ func TestLogger(t *testing.T) {
 	logger.Warnf("warn level")
 	logger.Error("error level")
 
-	d, _ := ioutil.ReadFile(f.Name())
+	d, _ := os.ReadFile(f.Name())
 	s := string(d)
 	if strings.Contains(s, "info level") || strings.Contains(s, "debug level") {
 		t.Fatalf("info/debug should not be logged: %s", s)
 	} else if !strings.Contains(s, "warn level") || !strings.Contains(s, "error level") {
 		t.Fatalf("warn/error should be logged: %s", s)
+	} else if !strings.Contains(s, "testid") {
+		t.Fatalf("logid \"testid\" should be logged: %s", s)
+	}
+}
+
+func TestMethodName(t *testing.T) {
+	type args struct {
+		fullFuncName string
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{{
+		name: "main",
+		args: args{
+			fullFuncName: "cmd.Main",
+		},
+		want: "Main",
+	}, {
+		name: "nested method",
+		args: args{
+			fullFuncName: "github.com/juicedata/juicefs/cmd.watchdog.func1",
+		},
+		want: "watchdog",
+	}, {
+		name: "multiple inits",
+		args: args{
+			fullFuncName: "github.com/juicedata/juicefs/pkg/utils.init.3.func1",
+		},
+		want: "init",
+	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := methodName(tt.args.fullFuncName); got != tt.want {
+				t.Errorf("methodName() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

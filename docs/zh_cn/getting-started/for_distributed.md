@@ -1,11 +1,11 @@
 ---
-sidebar_label: 快速上手（分布式模式）
 sidebar_position: 3
+description: 本文将指导你使用基于云的对象存储和数据库，构建一个具有分布式和共享访问能力的 JuiceFS 文件系统。
 ---
 
-# 分布式模式快速上手指南
+# 分布式模式
 
-上一篇文档[「JuiceFS 单机模式快速上手指南」](./README.md)通过采用「对象存储」和「SQLite」数据库的组合，实现了一个可以在任意主机上挂载的文件系统。得益于对象存储是可以被网络上任何有权限的计算机访问的特点，我们只需要把 SQLite 数据库文件复制到任何想要访问该存储的计算机，就可以实现在不同计算机上访问同一个 JuiceFS 文件系统。
+上一篇文档[「JuiceFS 单机模式快速上手指南」](./standalone.md)通过采用「对象存储」和「SQLite」数据库的组合，实现了一个可以在任意主机上挂载的文件系统。得益于对象存储是可以被网络上任何有权限的计算机访问的特点，我们只需要把 SQLite 数据库文件复制到任何想要访问该存储的计算机，就可以实现在不同计算机上访问同一个 JuiceFS 文件系统。
 
 很显然，想要依靠在计算机之间复制 SQLite 数据库的方式进行文件系统共享，虽然可行，但文件的实时性是得不到保证的。受限于 SQLite 这种单文件数据库无法被多个计算机同时读写访问的情况，为了能够让一个文件系统可以在分布式环境中被多个计算机同时挂载读写，我们需要采用支持通过网络访问的数据库，比如 Redis、PostgreSQL、MySQL 等。
 
@@ -20,7 +20,7 @@ sidebar_position: 3
 
 JuiceFS 目前支持的基于网络的数据库有：
 
-- **键值数据库**：Redis、TiKV
+- **键值数据库**：Redis、TiKV、etcd、FoundationDB
 - **关系型数据库**：PostgreSQL、MySQL、MariaDB
 
 不同的数据库性能和稳定性表现也各不相同，比如 Redis 是内存型键值数据库，性能极为出色，但可靠性相对较弱。PostgreSQL 是关系型数据库，相比之下性能没有内存型强悍，但它的可靠性要更强。
@@ -46,7 +46,7 @@ JuiceFS 目前支持的基于网络的数据库有：
 
 ### 2. 准备对象存储
 
-以下是以阿里云 OSS 为例的伪样本，你可以改用其他对象存储，详情参考 [JuiceFS 支持的存储](../guide/how_to_set_up_object_storage.md#支持的存储服务)。
+以下是以阿里云 OSS 为例的伪样本，你可以改用其他对象存储，详情参考 [JuiceFS 支持的存储](../reference/how_to_set_up_object_storage.md#supported-object-storage)。
 
 - **Bucket Endpoint**：`https://myjfs.oss-cn-shanghai.aliyuncs.com`
 - **Access Key ID**：`ABCDEFGHIJKLMNopqXYZ`
@@ -54,7 +54,7 @@ JuiceFS 目前支持的基于网络的数据库有：
 
 ### 3. 准备数据库
 
-以下是以阿里云数据库 Redis 版为例的伪样本，你可以改用其他类型的数据库，详情参考 [JuiceFS 支持的数据库](../guide/how_to_set_up_metadata_engine.md)。
+以下是以阿里云数据库 Redis 版为例的伪样本，你可以改用其他类型的数据库，详情参考 [JuiceFS 支持的数据库](../reference/how_to_set_up_metadata_engine.md)。
 
 - **数据库地址**：`myjfs-sh-abc.redis.rds.aliyuncs.com:6379`
 - **数据库用户名**：`tom`
@@ -94,8 +94,8 @@ juicefs format \
 2021/12/16 16:37:14.593450 juicefs[22290] <INFO>: Volume is formatted as {Name:myjfs UUID:4ad0bb86-6ef5-4861-9ce2-a16ac5dea81b Storage:oss Bucket:https://myjfs AccessKey:ABCDEFGHIJKLMNopqXYZ SecretKey:removed BlockSize:4096 Compression:none Shards:0 Partitions:0 Capacity:0 Inodes:0 EncryptKey:}
 ```
 
-:::info 说明
-文件系统一经创建，相关的信息包括名称、对象存储、访问密钥等信息会完整的记录到数据库中。在当前的示例中，文件系统的信息被记录在 Redis 数据库中，因此在任何一台计算机上，只要拥有数据库地址、用户名和密码信息，就可以挂载读写该文件系统。
+:::info
+文件系统创建完毕以后，包含对象存储密钥等信息会完整的记录到数据库中。JuiceFS 客户端只要拥有数据库地址、用户名和密码信息，就可以挂载读写该文件系统。也正因此，JuiceFS 客户端没有本地配置文件（作为对比，JuiceFS 云服务用 [`juicefs auth`](https://juicefs.com/docs/zh/cloud/reference/commands_reference/#auth) 命令进行认证、获取配置文件）。
 :::
 
 ### 5. 挂载文件系统
@@ -112,7 +112,7 @@ juicefs mount redis://tom:mypassword@myjfs-sh-abc.redis.rds.aliyuncs.com:6379/1 
 
 #### 调大缓存提升性能
 
-由于「对象存储」是基于网络的存储服务，不可避免会产生访问延时。为了解决这个问题，JuiceFS 提供并默认启用了缓存机制，即划拨一部分本地存储作为数据与对象存储之间的一个缓冲层，读取文件时会异步地将数据缓存到本地存储，详情请查阅[「缓存」](../guide/cache_management.md)。
+由于「对象存储」是基于网络的存储服务，不可避免会产生访问延时。为了解决这个问题，JuiceFS 提供并默认启用了缓存机制，即划拨一部分本地存储作为数据与对象存储之间的一个缓冲层，读取文件时会异步地将数据缓存到本地存储，详情请查阅[「缓存」](../guide/cache.md)。
 
 缓存机制让 JuiceFS 可以高效处理海量数据的读写任务，默认情况下，JuiceFS 会在 `$HOME/.juicefs/cache` 或 `/var/jfsCache` 目录设置 100GiB 的缓存。在速度更快的 SSD 上设置更大的缓存空间可以有效提升 JuiceFS 的读写性能。
 
@@ -135,21 +135,21 @@ JuiceFS 进程需要具有读写 `--cache-dir` 目录的权限。
 
 #### 开机自动挂载
 
-以 Linux 系统为例，假设客户端位于 `/usr/local/bin` 目录。将 JuiceFS 客户端重命名为 `mount.juicefs` 并复制到 `/sbin` 目录：
-
-```shell
-sudo cp /usr/local/bin/juicefs /sbin/mount.juicefs
-```
-
-编辑 `/etc/fstab` 配置文件，遵照 fstab 的规则添加一条新记录：
-
-```
-redis://tom:mypassword@myjfs-sh-abc.redis.rds.aliyuncs.com:6379/1    /mnt/myjfs    juicefs    _netdev,max-uploads=50,writeback,cache-size=512000     0  0
-```
+在 Linux 环境中，可以在挂载文件系统时通过 `--update-fstab` 选项设置自动挂载，这个选项会将挂载 JuiceFS 所需的选项添加到 `/etc/fstab` 中。例如：
 
 :::note 注意
-默认情况下，CentOS 6 在系统启动时不会挂载网络文件系统，你需要执行命令开启网络文件系统的自动挂载支持：`sudo chkconfig --add netfs`
+此特性需要使用 1.1.0 及以上版本的 JuiceFS
 :::
+
+```bash
+$ sudo juicefs mount --update-fstab --max-uploads=50 --writeback --cache-size 204800 redis://tom:mypassword@myjfs-sh-abc.apse1.cache.amazonaws.com:6379/1 <MOUNTPOINT>
+$ grep <MOUNTPOINT> /etc/fstab
+redis://tom:mypassword@myjfs-sh-abc.apse1.cache.amazonaws.com:6379/1 <MOUNTPOINT> juicefs _netdev,max-uploads=50,writeback,cache-size=204800 0 0
+$ ls -l /sbin/mount.juicefs
+lrwxrwxrwx 1 root root 29 Aug 11 16:43 /sbin/mount.juicefs -> /usr/local/bin/juicefs
+```
+
+更多请参考[「启动时自动挂载 JuiceFS」](../administration/mount_at_boot.md)。
 
 ### 6. 验证文件系统
 
@@ -174,8 +174,6 @@ juicefs bench ~/jfs
 ```shell
 juicefs umount ~/jfs
 ```
-
-#### 卸载失败
 
 如果执行命令后，文件系统卸载失败，提示 `Device or resource busy`：
 

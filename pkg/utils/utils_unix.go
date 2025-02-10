@@ -21,7 +21,12 @@ package utils
 
 import (
 	"os"
+	"os/exec"
+	"strconv"
+	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 func GetFileInode(path string) (uint64, error) {
@@ -44,4 +49,30 @@ func GetDev(fpath string) int { // ID of device containing file
 		return int(sst.Dev)
 	}
 	return -1
+}
+
+func GetKernelInfo() (string, error) {
+	kernel, err := exec.Command("uname", "-a").Output()
+	if err != nil {
+		return "", err
+	}
+
+	// Ignore hostname information
+	tmp := strings.Split(string(kernel), " ")
+	result := strings.Join(append(tmp[:1], tmp[2:]...), " ")
+	return result, nil
+}
+
+func GetUmask() int {
+	umask := syscall.Umask(0)
+	syscall.Umask(umask)
+	return umask
+}
+
+func ErrnoName(err syscall.Errno) string {
+	errName := unix.ErrnoName(err)
+	if errName == "" {
+		errName = strconv.Itoa(int(err))
+	}
+	return errName
 }

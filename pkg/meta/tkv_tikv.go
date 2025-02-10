@@ -22,16 +22,20 @@ package meta
 import (
 	"context"
 	"net/url"
+	"os"
 	"strings"
+	"time"
 
 	plog "github.com/pingcap/log"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/tikv/client-go/v2/config"
 	tikverr "github.com/tikv/client-go/v2/error"
+	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/tikv"
 	"github.com/tikv/client-go/v2/txnkv"
 	"github.com/tikv/client-go/v2/txnkv/txnutil"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -54,27 +58,37 @@ func newTikvClient(addr string) (tkvClient, error) {
 	default:
 		plvl = "dpanic"
 	}
-	l, prop, _ := plog.InitLogger(&plog.Config{Level: plvl})
+	l, prop, _ := plog.InitLogger(&plog.Config{Level: plvl}, zap.Fields(zap.String("component", "tikv"), zap.Int("pid", os.Getpid())))
 	plog.ReplaceGlobals(l, prop)
 
 	tUrl, err := url.Parse("tikv://" + addr)
 	if err != nil {
 		return nil, err
 	}
+	query := tUrl.Query()
 	config.UpdateGlobal(func(conf *config.Config) {
-		q := tUrl.Query()
 		conf.Security = config.NewSecurity(
-			q.Get("ca"),
-			q.Get("cert"),
-			q.Get("key"),
-			strings.Split(q.Get("verify-cn"), ","))
+			query.Get("ca"),
+			query.Get("cert"),
+			query.Get("key"),
+			strings.Split(query.Get("verify-cn"), ","))
 	})
+	interval := time.Hour * 3
+	if dur, err := time.ParseDuration(query.Get("gc-interval")); err == nil {
+		if dur != 0 && dur < time.Hour {
+			logger.Warnf("TiKV gc-interval (%s) is too short, and is reset to 1h", dur)
+			dur = time.Hour
+		}
+		interval = dur
+	}
+	logger.Infof("TiKV gc interval is set to %s", interval)
+
 	client, err := txnkv.NewClient(strings.Split(tUrl.Host, ","))
 	if err != nil {
 		return nil, err
 	}
 	prefix := strings.TrimLeft(tUrl.Path, "/")
-	return withPrefix(&tikvClient{client.KVStore}, append([]byte(prefix), 0xFD)), nil
+	return withPrefix(&tikvClient{client.KVStore, interval}, append([]byte(prefix), 0xFD)), nil
 }
 
 type tikvTxn struct {
@@ -104,57 +118,21 @@ func (tx *tikvTxn) gets(keys ...[]byte) [][]byte {
 	return values
 }
 
-func (tx *tikvTxn) scanRange0(begin, end []byte, limit int, filter func(k, v []byte) bool) map[string][]byte {
-	if limit == 0 {
-		return nil
-	}
-
+func (tx *tikvTxn) scan(begin, end []byte, keysOnly bool, handler func(k, v []byte) bool) {
+	snap := tx.GetSnapshot()
+	snap.SetScanBatchSize(10240)
+	snap.SetNotFillCache(true)
+	snap.SetKeyOnly(keysOnly)
 	it, err := tx.Iter(begin, end)
 	if err != nil {
 		panic(err)
 	}
 	defer it.Close()
-	var ret = make(map[string][]byte)
-	for it.Valid() {
-		key := it.Key()
-		value := it.Value()
-		if filter == nil || filter(key, value) {
-			ret[string(key)] = value
-			if limit > 0 {
-				if limit--; limit == 0 {
-					break
-				}
-			}
-		}
+	for it.Valid() && handler(it.Key(), it.Value()) {
 		if err = it.Next(); err != nil {
 			panic(err)
 		}
 	}
-	return ret
-}
-
-func (tx *tikvTxn) scanRange(begin, end []byte) map[string][]byte {
-	return tx.scanRange0(begin, end, -1, nil)
-}
-
-func (tx *tikvTxn) scanKeys(prefix []byte) [][]byte {
-	it, err := tx.Iter(prefix, nextKey(prefix))
-	if err != nil {
-		panic(err)
-	}
-	defer it.Close()
-	var ret [][]byte
-	for it.Valid() {
-		ret = append(ret, it.Key())
-		if err = it.Next(); err != nil {
-			panic(err)
-		}
-	}
-	return ret
-}
-
-func (tx *tikvTxn) scanValues(prefix []byte, limit int, filter func(k, v []byte) bool) map[string][]byte {
-	return tx.scanRange0(prefix, nextKey(prefix), limit, filter)
 }
 
 func (tx *tikvTxn) exist(prefix []byte) bool {
@@ -172,10 +150,9 @@ func (tx *tikvTxn) set(key, value []byte) {
 	}
 }
 
-func (tx *tikvTxn) append(key []byte, value []byte) []byte {
+func (tx *tikvTxn) append(key []byte, value []byte) {
 	new := append(tx.get(key), value...)
 	tx.set(key, new)
-	return new
 }
 
 func (tx *tikvTxn) incrBy(key []byte, value int64) int64 {
@@ -188,16 +165,15 @@ func (tx *tikvTxn) incrBy(key []byte, value int64) int64 {
 	return new
 }
 
-func (tx *tikvTxn) dels(keys ...[]byte) {
-	for _, key := range keys {
-		if err := tx.Delete(key); err != nil {
-			panic(err)
-		}
+func (tx *tikvTxn) delete(key []byte) {
+	if err := tx.Delete(key); err != nil {
+		panic(err)
 	}
 }
 
 type tikvClient struct {
-	client *tikv.KVStore
+	client     *tikv.KVStore
+	gcInterval time.Duration
 }
 
 func (c *tikvClient) name() string {
@@ -208,8 +184,25 @@ func (c *tikvClient) shouldRetry(err error) bool {
 	return strings.Contains(err.Error(), "write conflict") || strings.Contains(err.Error(), "TxnLockNotFound")
 }
 
-func (c *tikvClient) txn(f func(kvTxn) error) (err error) {
-	tx, err := c.client.Begin()
+func (c *tikvClient) config(key string) interface{} {
+	if key == "startTS" {
+		ts, err := c.client.CurrentTimestamp(oracle.GlobalTxnScope)
+		if err != nil {
+			logger.Warnf("TiKV get startTS: %s", err)
+			return nil
+		}
+		return ts
+	}
+	return nil
+}
+
+func (c *tikvClient) txn(ctx context.Context, f func(*kvTxn) error, retry int) (err error) {
+	var opts []tikv.TxnOption
+	if val := ctx.Value(txSessionKey{}); val != nil {
+		opts = append(opts, tikv.WithStartTS(val.(uint64)))
+	}
+
+	tx, err := c.client.Begin(opts...)
 	if err != nil {
 		return err
 	}
@@ -223,7 +216,7 @@ func (c *tikvClient) txn(f func(kvTxn) error) (err error) {
 			}
 		}
 	}()
-	if err = f(&tikvTxn{tx}); err != nil {
+	if err = f(&kvTxn{&tikvTxn{tx}, retry}); err != nil {
 		return err
 	}
 	if !tx.IsReadOnly() {
@@ -264,4 +257,16 @@ func (c *tikvClient) reset(prefix []byte) error {
 
 func (c *tikvClient) close() error {
 	return c.client.Close()
+}
+
+func (c *tikvClient) gc() {
+	if c.gcInterval == 0 {
+		return
+	}
+	safePoint, err := c.client.GC(context.Background(), oracle.GoTimeToTS(time.Now().Add(-c.gcInterval)))
+	if err == nil {
+		logger.Debugf("TiKV GC returns new safe point: %d (%s)", safePoint, oracle.GetTimeFromTS(safePoint))
+	} else {
+		logger.Warnf("TiKV GC: %s", err)
+	}
 }

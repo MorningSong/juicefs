@@ -18,15 +18,14 @@ package cmd
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
-	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/utils"
-	"github.com/mattn/go-isatty"
 	"github.com/urfave/cli/v2"
 )
 
@@ -46,12 +45,12 @@ $ juicefs stats /mnt/jfs
 # More metrics
 $ juicefs stats /mnt/jfs -l 1
 
-Details: https://juicefs.com/docs/community/stats_watcher`,
+Details: https://juicefs.com/docs/community/fault_diagnosis_and_analysis#stats`,
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:  "schema",
 				Value: "ufmco",
-				Usage: "schema string that controls the output sections (u: usage, f: fuse, m: meta, c: blockcache, o: object, g: go)",
+				Usage: "schema string of output sections (t:time, u: usage, f: fuse, m: meta, c: blockcache, o: object, g: go)",
 			},
 			&cli.UintFlag{
 				Name:  "interval",
@@ -62,6 +61,11 @@ Details: https://juicefs.com/docs/community/stats_watcher`,
 				Name:    "verbosity",
 				Aliases: []string{"l"},
 				Usage:   "verbosity level, 0 or 1 is enough for most cases",
+			},
+			&cli.UintFlag{
+				Name:    "count",
+				Aliases: []string{"c"},
+				Usage:   "number of updates to display before exiting",
 			},
 		},
 	}
@@ -84,19 +88,21 @@ const (
 	COLOR_SEQ      = "\033[1;" // %dm
 	COLOR_DARK_SEQ = "\033[0;" // %dm
 	UNDERLINE_SEQ  = "\033[4m"
+	CLEAR_SCREEM   = "\033[2J\033[1;1H"
+	UNIXTIME_FMT   = "01-02 15:04:05"
 	// BOLD_SEQ       = "\033[1m"
 )
 
 type statsWatcher struct {
-	tty      bool
+	colorful bool
 	interval uint
-	path     string
+	mp       string
 	header   string
 	sections []*section
 }
 
 func (w *statsWatcher) colorize(msg string, color int, dark bool, underline bool) string {
-	if !w.tty || msg == "" || msg == " " {
+	if !w.colorful || msg == "" || msg == " " {
 		return msg
 	}
 	var cseq, useq string
@@ -119,6 +125,7 @@ const (
 	metricGauge
 	metricCounter
 	metricHist
+	metricUnixtime
 )
 
 type item struct {
@@ -136,6 +143,9 @@ func (w *statsWatcher) buildSchema(schema string, verbosity uint) {
 	for _, r := range schema {
 		var s section
 		switch r {
+		case 't':
+			s.name = "system"
+			s.items = append(s.items, &item{"time", "juicefs_timestamp", metricUnixtime})
 		case 'u':
 			s.name = "usage"
 			s.items = append(s.items, &item{"cpu", "juicefs_cpu_usage", metricCPU | metricCounter})
@@ -210,7 +220,11 @@ func (w *statsWatcher) formatHeader() {
 	for i, s := range w.sections {
 		subs := make([]string, 0, len(s.items))
 		for _, it := range s.items {
-			subs = append(subs, w.colorize(padding(it.nick, 5, ' '), BLUE, false, true))
+			if (it.typ & 0xF0) == metricUnixtime {
+				subs = append(subs, w.colorize(padding(it.nick, len(UNIXTIME_FMT), ' '), BLUE, false, true))
+			} else {
+				subs = append(subs, w.colorize(padding(it.nick, 5, ' '), BLUE, false, true))
+			}
 			if it.typ&metricHist != 0 {
 				if it.typ&metricTime != 0 {
 					subs = append(subs, w.colorize(" lat ", BLUE, false, true))
@@ -220,6 +234,9 @@ func (w *statsWatcher) formatHeader() {
 			}
 		}
 		width := 6*len(subs) - 1 // nick(5) + space(1)
+		if s.name == "system" {
+			width = len(UNIXTIME_FMT)
+		}
 		subHeaders[i] = strings.Join(subs, " ")
 		headers[i] = w.colorize(padding(s.name, width, '-'), BLUE, true, false)
 	}
@@ -293,7 +310,7 @@ func (w *statsWatcher) formatCPU(v float64, dark bool) string {
 }
 
 func (w *statsWatcher) printDiff(left, right map[string]float64, dark bool) {
-	if !w.tty && dark {
+	if !w.colorful && dark {
 		return
 	}
 	values := make([]string, len(w.sections))
@@ -301,6 +318,12 @@ func (w *statsWatcher) printDiff(left, right map[string]float64, dark bool) {
 		vals := make([]string, 0, len(s.items))
 		for _, it := range s.items {
 			switch it.typ & 0xF0 {
+			case metricUnixtime: // current timestamp
+				if dark {
+					vals = append(vals, w.colorize(time.Now().Format(UNIXTIME_FMT), BLACK, false, false))
+				} else {
+					vals = append(vals, w.colorize(time.Now().Format(UNIXTIME_FMT), WHITE, true, false))
+				}
 			case metricGauge: // currently must be metricByte
 				vals = append(vals, w.formatU64(right[it.name], dark, true))
 			case metricCounter:
@@ -333,23 +356,26 @@ func (w *statsWatcher) printDiff(left, right map[string]float64, dark bool) {
 		}
 		values[i] = strings.Join(vals, " ")
 	}
-	if w.tty && dark {
+	if w.colorful && dark {
 		fmt.Printf("%s\r", strings.Join(values, w.colorize("|", BLUE, true, false)))
 	} else {
 		fmt.Printf("%s\n", strings.Join(values, w.colorize("|", BLUE, true, false)))
 	}
 }
 
-func readStats(path string) map[string]float64 {
-	f, err := os.Open(path)
+func readStats(mp string) map[string]float64 {
+	f, err := os.Open(filepath.Join(mp, ".jfs.stats"))
+	if os.IsNotExist(err) {
+		f, err = os.Open(filepath.Join(mp, ".stats"))
+	}
 	if err != nil {
-		logger.Warnf("open %s: %s", path, err)
+		logger.Warnf("open stats file under mount point %s: %s", mp, err)
 		return nil
 	}
 	defer f.Close()
-	d, err := ioutil.ReadAll(f)
+	d, err := io.ReadAll(f)
 	if err != nil {
-		logger.Warnf("read %s: %s", path, err)
+		logger.Warnf("read stats file under mount point %s: %s", mp, err)
 		return nil
 	}
 	stats := make(map[string]float64)
@@ -357,10 +383,11 @@ func readStats(path string) map[string]float64 {
 	for _, line := range lines {
 		fields := strings.Fields(line)
 		if len(fields) == 2 {
-			stats[fields[0]], err = strconv.ParseFloat(fields[1], 64)
+			v, err := strconv.ParseFloat(fields[1], 64)
 			if err != nil {
 				logger.Warnf("parse %s: %s", fields[1], err)
 			}
+			stats[fields[0]] += v
 		}
 	}
 	return stats
@@ -378,18 +405,19 @@ func stats(ctx *cli.Context) error {
 	}
 
 	watcher := &statsWatcher{
-		tty:      !ctx.Bool("no-color") && isatty.IsTerminal(os.Stdout.Fd()),
+		colorful: !ctx.Bool("no-color") && utils.SupportANSIColor(os.Stdout.Fd()),
 		interval: ctx.Uint("interval"),
-		path:     path.Join(mp, ".stats"),
+		mp:       mp,
 	}
 	watcher.buildSchema(ctx.String("schema"), ctx.Uint("verbosity"))
 	watcher.formatHeader()
+	count := ctx.Uint("count")
 
 	var tick uint
 	var start, last, current map[string]float64
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	current = readStats(watcher.path)
+	current = readStats(watcher.mp)
 	start = current
 	last = current
 	for {
@@ -402,9 +430,13 @@ func stats(ctx *cli.Context) error {
 		} else {
 			watcher.printDiff(last, current, true)
 		}
+		if count > 0 && tick >= watcher.interval*(count-1) {
+			break
+		}
 		last = current
 		tick++
 		<-ticker.C
-		current = readStats(watcher.path)
+		current = readStats(watcher.mp)
 	}
+	return nil
 }

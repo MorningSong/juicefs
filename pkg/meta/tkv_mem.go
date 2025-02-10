@@ -1,6 +1,3 @@
-//go:build !fdb
-// +build !fdb
-
 /*
  * JuiceFS, Copyright 2021 Juicedata, Inc.
  *
@@ -20,9 +17,11 @@
 package meta
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strings"
 	"sync"
 
@@ -38,7 +37,7 @@ const settingPath = "/tmp/juicefs.memkv.setting.json"
 
 func newMockClient(addr string) (tkvClient, error) {
 	client := &memKV{items: btree.New(2), temp: &kvItem{}}
-	if d, err := ioutil.ReadFile(settingPath); err == nil {
+	if d, err := os.ReadFile(settingPath); err == nil {
 		var buffer map[string][]byte
 		if err = json.Unmarshal(d, &buffer); err == nil {
 			for k, v := range buffer {
@@ -80,22 +79,18 @@ func (tx *memTxn) gets(keys ...[]byte) [][]byte {
 	return values
 }
 
-func (tx *memTxn) scanRange(begin_, end_ []byte) map[string][]byte {
+func (tx *memTxn) scan(begin, end []byte, keysOnly bool, handler func(k, v []byte) bool) {
 	tx.store.Lock()
 	defer tx.store.Unlock()
-	begin := string(begin_)
-	end := string(end_)
-	ret := make(map[string][]byte)
-	tx.store.items.AscendGreaterOrEqual(&kvItem{key: begin}, func(i btree.Item) bool {
+	tx.store.items.AscendGreaterOrEqual(&kvItem{key: string(begin)}, func(i btree.Item) bool {
 		it := i.(*kvItem)
-		if end == "" || it.key < end {
-			tx.observed[it.key] = it.ver
-			ret[it.key] = it.value
-			return true
+		key := []byte(it.key)
+		if bytes.Compare(key, end) >= 0 {
+			return false
 		}
-		return false
+		tx.observed[it.key] = it.ver
+		return handler(key, it.value)
 	})
-	return ret
 }
 
 func nextKey(key []byte) []byte {
@@ -118,57 +113,28 @@ func nextKey(key []byte) []byte {
 	return next
 }
 
-func (tx *memTxn) scanKeys(prefix_ []byte) [][]byte {
-	var keys [][]byte
+func (tx *memTxn) exist(prefix []byte) bool {
+	var ret bool
 	tx.store.Lock()
 	defer tx.store.Unlock()
-	prefix := string(prefix_)
-	tx.store.items.AscendGreaterOrEqual(&kvItem{key: prefix}, func(i btree.Item) bool {
+	tx.store.items.AscendGreaterOrEqual(&kvItem{key: string(prefix)}, func(i btree.Item) bool {
 		it := i.(*kvItem)
-		if strings.HasPrefix(it.key, prefix) {
+		if strings.HasPrefix(it.key, string(prefix)) {
 			tx.observed[it.key] = it.ver
-			keys = append(keys, []byte(it.key))
-			return true
+			ret = true
 		}
 		return false
 	})
-	return keys
-}
-
-func (tx *memTxn) scanValues(prefix []byte, limit int, filter func(k, v []byte) bool) map[string][]byte {
-	if limit == 0 {
-		return nil
-	}
-
-	res := tx.scanRange(prefix, nextKey(prefix))
-	for k, v := range res {
-		if filter != nil && !filter([]byte(k), v) {
-			delete(res, k)
-		}
-	}
-	if n := len(res) - limit; limit > 0 && n > 0 {
-		for k := range res {
-			delete(res, k)
-			if n--; n == 0 {
-				break
-			}
-		}
-	}
-	return res
-}
-
-func (tx *memTxn) exist(prefix []byte) bool {
-	return len(tx.scanKeys(prefix)) > 0
+	return ret
 }
 
 func (tx *memTxn) set(key, value []byte) {
 	tx.buffer[string(key)] = value
 }
 
-func (tx *memTxn) append(key []byte, value []byte) []byte {
+func (tx *memTxn) append(key []byte, value []byte) {
 	new := append(tx.get(key), value...)
 	tx.set(key, new)
-	return new
 }
 
 func (tx *memTxn) incrBy(key []byte, value int64) int64 {
@@ -181,10 +147,8 @@ func (tx *memTxn) incrBy(key []byte, value int64) int64 {
 	return new
 }
 
-func (tx *memTxn) dels(keys ...[]byte) {
-	for _, key := range keys {
-		tx.buffer[string(key)] = nil
-	}
+func (tx *memTxn) delete(key []byte) {
+	tx.buffer[string(key)] = nil
 }
 
 type kvItem struct {
@@ -211,6 +175,10 @@ func (c *memKV) shouldRetry(err error) bool {
 	return strings.Contains(err.Error(), "write conflict")
 }
 
+func (c *memKV) config(key string) interface{} {
+	return nil
+}
+
 func (c *memKV) get(key string) *kvItem {
 	c.temp.key = key
 	it := c.items.Get(c.temp)
@@ -235,13 +203,13 @@ func (c *memKV) set(key string, value []byte) {
 	}
 }
 
-func (c *memKV) txn(f func(kvTxn) error) error {
+func (c *memKV) txn(ctx context.Context, f func(*kvTxn) error, retry int) error {
 	tx := &memTxn{
 		store:    c,
 		observed: make(map[string]int),
 		buffer:   make(map[string][]byte),
 	}
-	if err := f(tx); err != nil {
+	if err := f(&kvTxn{tx, retry}); err != nil {
 		return err
 	}
 
@@ -260,7 +228,7 @@ func (c *memKV) txn(f func(kvTxn) error) error {
 	}
 	if _, ok := tx.buffer["setting"]; ok {
 		d, _ := json.Marshal(tx.buffer)
-		if err := ioutil.WriteFile(settingPath, d, 0644); err != nil {
+		if err := os.WriteFile(settingPath, d, 0644); err != nil {
 			return err
 		}
 	}
@@ -272,10 +240,11 @@ func (c *memKV) txn(f func(kvTxn) error) error {
 
 func (c *memKV) scan(prefix []byte, handler func(key []byte, value []byte)) error {
 	c.Lock()
-	defer c.Unlock()
+	snap := c.items.Clone()
+	c.Unlock()
 	begin := string(prefix)
 	end := string(nextKey(prefix))
-	c.items.AscendGreaterOrEqual(&kvItem{key: begin}, func(i btree.Item) bool {
+	snap.AscendGreaterOrEqual(&kvItem{key: begin}, func(i btree.Item) bool {
 		it := i.(*kvItem)
 		if end != "" && it.key >= end {
 			return false
@@ -294,13 +263,15 @@ func (c *memKV) reset(prefix []byte) error {
 		c.Unlock()
 		return nil
 	}
-	return c.txn(func(kt kvTxn) error {
+	return c.txn(Background(), func(kt *kvTxn) error {
 		return c.scan(prefix, func(key, value []byte) {
-			kt.dels(key)
+			kt.delete(key)
 		})
-	})
+	}, 0)
 }
 
 func (c *memKV) close() error {
 	return nil
 }
+
+func (c *memKV) gc() {}

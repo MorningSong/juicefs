@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -110,8 +111,16 @@ func (s DefaultObjectStorage) Create() error {
 	return nil
 }
 
+func (s DefaultObjectStorage) Limits() Limits {
+	return Limits{IsSupportMultipartUpload: false, IsSupportUploadPartCopy: false}
+}
+
 func (s DefaultObjectStorage) Head(key string) (Object, error) {
 	return nil, notSupported
+}
+
+func (s DefaultObjectStorage) Copy(dst, src string) error {
+	return notSupported
 }
 
 func (s DefaultObjectStorage) CreateMultipartUpload(key string) (*MultipartUpload, error) {
@@ -119,6 +128,10 @@ func (s DefaultObjectStorage) CreateMultipartUpload(key string) (*MultipartUploa
 }
 
 func (s DefaultObjectStorage) UploadPart(key string, uploadID string, num int, body []byte) (*Part, error) {
+	return nil, notSupported
+}
+
+func (s DefaultObjectStorage) UploadPartCopy(key string, uploadID string, num int, srcKey string, off, size int64) (*Part, error) {
 	return nil, notSupported
 }
 
@@ -132,11 +145,11 @@ func (s DefaultObjectStorage) ListUploads(marker string) ([]*PendingPart, string
 	return nil, "", nil
 }
 
-func (s DefaultObjectStorage) List(prefix, marker string, limit int64) ([]Object, error) {
-	return nil, notSupported
+func (s DefaultObjectStorage) List(prefix, start, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
+	return nil, false, "", notSupported
 }
 
-func (s DefaultObjectStorage) ListAll(prefix, marker string) (<-chan Object, error) {
+func (s DefaultObjectStorage) ListAll(prefix, marker string, followLink bool) (<-chan Object, error) {
 	return nil, notSupported
 }
 
@@ -159,7 +172,117 @@ func CreateStorage(name, endpoint, accessKey, secretKey, token string) (ObjectSt
 
 var bufPool = sync.Pool{
 	New: func() interface{} {
-		buf := make([]byte, 32<<10)
+		// Default io.Copy uses 32KB buffer, here we choose a larger one (1MiB io-size increases throughput by ~20%)
+		buf := make([]byte, 1<<20)
 		return &buf
 	},
+}
+
+type listThread struct {
+	sync.Mutex
+	cond      *utils.Cond
+	ready     bool
+	err       error
+	entries   []Object
+	nextToken string
+	hasMore   bool
+}
+
+func ListAllWithDelimiter(store ObjectStorage, prefix, start, end string, followLink bool) (<-chan Object, error) {
+	entries, _, _, err := store.List(prefix, start, "", "/", 1e9, followLink)
+	if err != nil {
+		logger.Errorf("list %s: %s", prefix, err)
+		return nil, err
+	}
+
+	listed := make(chan Object, 10240)
+	var walk func(string, []Object) error
+	walk = func(prefix string, entries []Object) error {
+		var concurrent = 10
+		var err error
+		threads := make([]listThread, concurrent)
+		for c := 0; c < concurrent; c++ {
+			t := &threads[c]
+			t.cond = utils.NewCond(t)
+			go func(c int) {
+				for i := c; i < len(entries); i += concurrent {
+					key := entries[i].Key()
+					if end != "" && key >= end {
+						break
+					}
+					if key < start && !strings.HasPrefix(start, key) {
+						continue
+					}
+					if !entries[i].IsDir() || key == prefix {
+						continue
+					}
+					t.entries, t.hasMore, t.nextToken, t.err = store.List(key, "\x00", t.nextToken, "/", 1e9, followLink) // exclude itself
+					t.Lock()
+					t.ready = true
+					t.cond.Signal()
+					for t.ready {
+						t.cond.WaitWithTimeout(time.Second)
+						if err != nil {
+							t.Unlock()
+							return
+						}
+					}
+					t.Unlock()
+				}
+			}(c)
+		}
+
+		for i, e := range entries {
+			key := e.Key()
+			if end != "" && key >= end {
+				return nil
+			}
+			if key >= start {
+				listed <- e
+			} else if !strings.HasPrefix(start, key) {
+				continue
+			}
+			if !e.IsDir() || key == prefix {
+				continue
+			}
+
+			t := &threads[i%concurrent]
+			t.Lock()
+			for !t.ready {
+				t.cond.WaitWithTimeout(time.Millisecond * 10)
+			}
+			if t.err != nil {
+				err = t.err
+				t.Unlock()
+				return err
+			}
+			t.ready = false
+			t.cond.Signal()
+			children := t.entries
+			t.Unlock()
+
+			err = walk(key, children)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	go func() {
+		defer close(listed)
+		err := walk(prefix, entries)
+		if err != nil {
+			listed <- nil
+		}
+	}()
+	return listed, nil
+}
+
+func generateListResult(objs []Object, limit int64) ([]Object, bool, string, error) {
+	var nextMarker string
+	if len(objs) > 0 {
+		nextMarker = objs[len(objs)-1].Key()
+	}
+	return objs, len(objs) == int(limit), nextMarker, nil
 }

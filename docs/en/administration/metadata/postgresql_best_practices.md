@@ -45,12 +45,12 @@ It is recommended to make a plan for regularly backing up your database, and at 
 
 ## Using connection pooler
 
-Connection pooler is a middleware that works between client and database and reuses the earlier connection from the pool, which improve connection efficiency and reduce the loss of short connections. Commonly used connection poolers are [PgBouncer](https://www.pgbouncer.org/) and [Pgpool-II](https://www.pgpool.net/).
+Connection pooler is a middleware that works between client and database and reuses the earlier connection from the pool, which improve connection efficiency and reduce the loss of short connections. Commonly used connection poolers are [PgBouncer](https://www.pgbouncer.org) and [Pgpool-II](https://www.pgpool.net).
 
 ## High Availability
 
 The official PostgreSQL document [High Availability, Load Balancing, and Replication](https://www.postgresql.org/docs/current/different-replication-solutions.html) compares several common databases in terms of high availability solutions. Please choose the appropriate ones according to your needs.
 
 :::note
-JuiceFS uses [transactions](https://www.postgresql.org/docs/current/tutorial-transactions.html) to ensure atomicity of metadata operations. Since PostgreSQL does not yet support Muti-Shard (Distributed) transactions, do not use a multi-server distributed architecture for the JuiceFS metadata.
+JuiceFS uses [transactions](https://www.postgresql.org/docs/current/tutorial-transactions.html) to ensure atomicity of metadata operations. Since PostgreSQL does not yet support Multi-Shard (Distributed) transactions, do not use a multi-server distributed architecture for the JuiceFS metadata.
 :::

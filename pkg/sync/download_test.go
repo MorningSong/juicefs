@@ -19,11 +19,11 @@ package sync
 import (
 	"bytes"
 	"io"
-	"math/rand"
 	"os"
 	"testing"
 
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/juicedata/juicefs/pkg/utils"
 )
 
 func TestDownload(t *testing.T) {
@@ -33,7 +33,6 @@ func TestDownload(t *testing.T) {
 		os.RemoveAll("/tmp/download/")
 	})
 	type config struct {
-		blockSize  int64
 		concurrent int
 		fsize      int64
 	}
@@ -43,7 +42,8 @@ func TestDownload(t *testing.T) {
 	}
 
 	tcases := []tcase{
-		{config: config{fsize: 1110, concurrent: 4, blockSize: 300}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+		{config: config{fsize: downloadBufSize*3 + 100, concurrent: 4}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+			defer pr.Close()
 			res, err := io.ReadAll(pr)
 			if err != nil {
 				t.Fatal(err)
@@ -53,7 +53,8 @@ func TestDownload(t *testing.T) {
 			}
 		}},
 
-		{config: config{fsize: 97340326, concurrent: 4, blockSize: 5 << 20}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+		{config: config{fsize: 97340326, concurrent: 4}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+			defer pr.Close()
 			res, err := io.ReadAll(pr)
 			if err != nil {
 				t.Fatal(err)
@@ -63,7 +64,8 @@ func TestDownload(t *testing.T) {
 			}
 		}},
 
-		{config: config{fsize: 1110, concurrent: 5, blockSize: 300}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+		{config: config{fsize: downloadBufSize*3 + 100, concurrent: 5}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+			defer pr.Close()
 			res, err := io.ReadAll(pr)
 			if err != nil {
 				t.Fatal(err)
@@ -73,7 +75,8 @@ func TestDownload(t *testing.T) {
 			}
 		}},
 
-		{config: config{fsize: 1, concurrent: 5, blockSize: 10}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+		{config: config{fsize: 1, concurrent: 5}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+			defer pr.Close()
 			res := make([]byte, 1)
 			n, err := pr.Read(res)
 			if err != nil || n != 1 || res[0] != content[0] {
@@ -81,11 +84,12 @@ func TestDownload(t *testing.T) {
 			}
 			n, err = pr.Read(res)
 			if err != io.EOF || n != 0 {
-				t.Fatalf("err should be io.EOF or n should equal 0")
+				t.Fatalf("err should be io.EOF or n should equal 0, but got %s %d", err, n)
 			}
 		}},
 
-		{config: config{fsize: 2, concurrent: 5, blockSize: 10}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+		{config: config{fsize: 2, concurrent: 5}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+			defer pr.Close()
 			res := make([]byte, 1)
 			n, err := pr.Read(res)
 			if err != nil || n != 1 || res[0] != content[0] {
@@ -97,11 +101,12 @@ func TestDownload(t *testing.T) {
 			}
 			n, err = pr.Read(res)
 			if err != io.EOF || n != 0 {
-				t.Fatalf("err should be io.EOF or n should equal 0")
+				t.Fatalf("err should be io.EOF or n should equal 0, but got %s %d", err, n)
 			}
 		}},
 
-		{config: config{fsize: 2, concurrent: 1, blockSize: 10}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+		{config: config{fsize: 2, concurrent: 1}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+			defer pr.Close()
 			res := make([]byte, 1)
 			n, err := pr.Read(res)
 
@@ -114,20 +119,22 @@ func TestDownload(t *testing.T) {
 			}
 			n, err = pr.Read(res)
 			if err != io.EOF || n != 0 {
-				t.Fatalf("err should be io.EOF or n should equal 0")
+				t.Fatalf("err should be io.EOF or n should equal 0, but got %s %d", err, n)
 			}
 		}},
 
-		{config: config{fsize: 1000, concurrent: 3, blockSize: 5}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
-			res := make([]byte, 20)
+		{config: config{fsize: downloadBufSize * 20, concurrent: 3}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+			defer pr.Close()
+			resSize := 4 * downloadBufSize
+			res := make([]byte, 4*downloadBufSize)
 			n, err := io.ReadFull(pr, res)
 
-			if err != nil || n != 20 || res[0] != content[0] {
-				t.Fatalf("read 20 byte should succeed, but got %d, %s", n, err)
+			if err != nil || n != resSize || res[0] != content[0] {
+				t.Fatalf("read %v byte should succeed, but got %d, %s", resSize, n, err)
 			}
 			n, err = io.ReadFull(pr, res)
-			if err != nil || n != 20 || res[0] != content[20] {
-				t.Fatalf("read 20 byte should succeed, but got %d, %s", n, err)
+			if err != nil || n != resSize || res[0] != content[resSize] {
+				t.Fatalf("read %v byte should succeed, but got %d, %s", resSize, n, err)
 			}
 			_ = a.Delete(key)
 			n, err = io.ReadFull(pr, res)
@@ -137,28 +144,30 @@ func TestDownload(t *testing.T) {
 			}
 		}},
 
-		{config: config{fsize: 0, concurrent: 5, blockSize: 10}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+		{config: config{fsize: 0, concurrent: 5}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+			defer pr.Close()
 			res := make([]byte, 1)
 			n, err := pr.Read(res)
 			if err != io.EOF || n != 0 {
-				t.Fatalf("err should be io.EOF or n should equal 0")
+				t.Fatalf("err should be io.EOF or n should equal 0, but got %s %d", err, n)
 			}
 		}},
 
-		{config: config{fsize: 100, concurrent: 5, blockSize: 10}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+		{config: config{fsize: 10 * downloadBufSize, concurrent: 5}, tfunc: func(t *testing.T, pr *parallelDownloader, content []byte) {
+			defer pr.Close()
 			res := make([]byte, 1)
 			pr.key = "notExist"
 			n, err := pr.Read(res)
 			if !os.IsNotExist(err) || n != 0 {
-				t.Fatalf("err should be ErrNotExist or n should equal 0")
+				t.Fatalf("err should be ErrNotExist or n should equal 0, but got %s %d", err, n)
 			}
 		}},
 	}
 
 	for _, c := range tcases {
 		content := make([]byte, c.config.fsize)
-		rand.Read(content)
+		utils.RandRead(content)
 		_ = a.Put(key, bytes.NewReader(content))
-		c.tfunc(t, newParallelDownloader(a, key, c.config.fsize, c.blockSize, make(chan int, c.concurrent)), content)
+		c.tfunc(t, newParallelDownloader(a, key, c.config.fsize, downloadBufSize, make(chan int, c.concurrent)), content)
 	}
 }

@@ -16,39 +16,44 @@
 
 package io.juicefs.utils;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import io.juicefs.JuiceFileSystem;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.net.URI;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 
 public class FsNodesFetcher extends NodesFetcher {
-  private static final Log LOG = LogFactory.getLog(FsNodesFetcher.class);
+  private static final Logger LOG = LoggerFactory.getLogger(FsNodesFetcher.class);
+
+  private Configuration conf;
 
   public FsNodesFetcher(String jfsName) {
     super(jfsName);
   }
 
+  public void setConf(Configuration conf) {
+    this.conf = conf;
+  }
+
   @Override
   public List<String> fetchNodes(String uri) {
     Path path = new Path(uri);
-    try {
-      FileSystem fs = path.getFileSystem(new Configuration());
-      if (!fs.exists(path)) return null;
-      FSDataInputStream inputStream = fs.open(path);
-      List<String> res = new BufferedReader(new InputStreamReader(inputStream))
-              .lines().collect(Collectors.toList());
-      inputStream.close();
-      return res;
-    } catch (Throwable e) {
-      LOG.warn(e.getMessage());
+    try (FileSystem fs = FileSystem.newInstance(path.toUri(), conf);
+         FSDataInputStream inputStream = fs.open(path)) {
+      return new BufferedReader(new InputStreamReader(inputStream))
+          .lines().filter(l->!l.isEmpty()).collect(Collectors.toList());
+    } catch (Exception e) {
+      LOG.warn("fetch nodes from {} failed", uri, e);
     }
     return null;
   }

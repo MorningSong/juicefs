@@ -3,19 +3,10 @@ sidebar_label: Redis
 sidebar_position: 1
 slug: /redis_best_practices
 ---
+
 # Redis Best Practices
 
- Redis is a key component in JuiceFS architecture. It stores all file system metadata and serve metadata operation from client. If any problem occurs to Redis (e.g., unavailable service, losing data), it will directly reduce the read/write speed or cause data damage, and further affect user experience.
-
-:::tip
-It's highly recommended to use Redis service managed by public cloud provider if possible. See ["Recommended Managed Redis Service"](#recommended-managed-redis-service) for more information.
-:::
-
-If you insist to operate Redis yourself in production environment, please keep in mind that JuiceFS requires Redis version 4.0+. Moreover, it's recommended to pick an [official stable version](https://redis.io/download). Please read the following contents before deploying Redis.
-
-:::note
-Part of the content in this article comes from the Redis official website. If there is any inconsistency, please refer to the official Redis document.
-:::
+To ensure metadata service performance, we recommend use Redis service managed by public cloud provider, see [Recommended Managed Redis Service](#recommended-managed-redis-service).
 
 ## Memory usage
 
@@ -36,11 +27,11 @@ used_memory_dataset: 13439673592
 used_memory_dataset_perc: 70.12%
 ```
 
-Among them, `used_memory_rss` is the total memory size actually used by Redis, which includes not only the size of data stored in Redis (that is, `used_memory_dataset` above) but also some Redis [system overhead](https://redis.io/commands/memory-stats) (that is, `used_memory_overhead` above). As mentioned earlier that the metadata of each file occupies about 300 bytes, this is actually calculated by `used_memory_dataset`. If you find that the metadata of a single file in your JuiceFS file system occupies much more than 300 bytes, you can try to run [`juicefs gc`](../../reference/command_reference.md#juicefs-gc) command to clean up possible redundant data.
+Among them, `used_memory_rss` is the total memory size actually used by Redis, which includes not only the size of data stored in Redis (that is, `used_memory_dataset` above) but also some Redis [system overhead](https://redis.io/commands/memory-stats) (that is, `used_memory_overhead` above). As mentioned earlier that the metadata of each file occupies about 300 bytes, this is actually calculated by `used_memory_dataset`. If you find that the metadata of a single file in your JuiceFS file system occupies much more than 300 bytes, you can try to run [`juicefs gc`](../../reference/command_reference.mdx#gc) command to clean up possible redundant data.
 
 ## High availability
 
-### Sentinel mode
+### Sentinel mode {#sentinel-mode}
 
 [Redis Sentinel](https://redis.io/docs/manual/sentinel) is the official solution to high availability for Redis. It provides following capabilities:
 
@@ -51,7 +42,7 @@ Among them, `used_memory_rss` is the total memory size actually used by Redis, w
 
 **A stable release of Redis Sentinel is shipped since Redis 2.8**. Redis Sentinel version 1, shipped with Redis 2.6, is deprecated and should not be used.
 
-There're some [fundamental things](https://redis.io/docs/manual/sentinel#fundamental-things-to-know-about-sentinel-before-deploying) to know about before using it:
+Before start using Redis sentinel, learn the [fundamentals](https://redis.io/docs/manual/sentinel#fundamental-things-to-know-about-sentinel-before-deploying):
 
 1. You need at least three Sentinel instances for a robust deployment.
 2. The three Sentinel instances should be placed into computers or virtual machines that are believed to fail in an independent way. So for example different physical servers or Virtual Machines executed on different availability zones.
@@ -59,11 +50,11 @@ There're some [fundamental things](https://redis.io/docs/manual/sentinel#fundame
 4. There is no HA setup which is safe if you don't test from time to time in development environments, or even better if you can, in production environments, if they work. You may have a misconfiguration that will become apparent only when it's too late (at 3am when your master stops working).
 5. **Sentinel, Docker, or other forms of Network Address Translation or Port Mapping should be mixed with care**: Docker performs port remapping, breaking Sentinel auto discovery of other Sentinel processes and the list of replicas for a master.
 
-Please read the [official documentation](https://redis.io/docs/manual/sentinel) for more information.
+Read the [official documentation](https://redis.io/docs/manual/sentinel) for more information.
 
 Once Redis servers and Sentinels are deployed, `META-URL` can be specified as `redis[s]://[[USER]:PASSWORD@]MASTER_NAME,SENTINEL_ADDR[,SENTINEL_ADDR]:SENTINEL_PORT[/DB]`, for example:
 
-```bash
+```shell
 ./juicefs mount redis://:password@masterName,1.2.3.4,1.2.5.6:26379/2 ~/jfs
 ```
 
@@ -71,13 +62,11 @@ Once Redis servers and Sentinels are deployed, `META-URL` can be specified as `r
 For JuiceFS v0.16+, the `PASSWORD` in the URL will be used to connect Redis server, and the password for Sentinel should be provided using the environment variable `SENTINEL_PASSWORD`. For early versions of JuiceFS, the `PASSWORD` is used for both Redis server and Sentinel, which can be overwritten by the environment variables `SENTINEL_PASSWORD` and `REDIS_PASSWORD`.
 :::
 
-:::tip
-Since JuiceFS v1.0.0, it is supported to only connect Redis replica nodes when mounting file systems to reduce the load on Redis master node. In order to enable this feature, you must mount the JuiceFS file system in read-only mode (that is, set the `--read-only` mount option), and connect to the metadata engine through Redis Sentinel. Finally, you need to add `?route-read=replica` to the end of the metadata URL. For example: `redis://:password@masterName,1.2.3.4,1.2.5.6:26379/2?route-read=replica`.
+Since JuiceFS v1.0.0, it is supported to use Redis replica when mounting file systems, to reduce the load on Redis master. In order to achieve this, you must mount the JuiceFS file system in read-only mode (that is, set the `--read-only` mount option), and connect to the metadata engine through Redis Sentinel. Finally, you need to add `?route-read=replica` to the end of the metadata URL. For example: `redis://:password@masterName,1.2.3.4,1.2.5.6:26379/2?route-read=replica`.
 
 It should be noted that since the data of the Redis master node is asynchronously replicated to the replica nodes, the read metadata may not be the latest.
-:::
 
-### Cluster mode
+### Cluster mode {#cluster-mode}
 
 :::note
 This feature requires JuiceFS v1.0.0 or higher
@@ -99,12 +88,12 @@ Redis provides various options for [persistence](https://redis.io/docs/manual/pe
 
 - **RDB**: The RDB persistence performs point-in-time snapshots of your dataset at specified intervals.
 - **AOF**: The AOF persistence logs every write operation received by the server, which will be played again at server startup, meaning that the original dataset will be reconstructed each time server is restarted. Commands are logged using the same format as the Redis protocol in an append-only fashion. Redis is able to rewrite logs in the background when it gets too big.
-- **RDB+AOF** <span className="badge badge--success">Recommended</span>: It is possible to combine AOF and RDB in the same instance. Notice that, in this case, when Redis restarts the AOF file will be used to reconstruct the original dataset since it is guaranteed to be the most complete.
+- **RDB+AOF** <Badge type="success">Recommended</Badge>: It is possible to combine AOF and RDB in the same instance. Notice that, in this case, when Redis restarts the AOF file will be used to reconstruct the original dataset since it is guaranteed to be the most complete.
 
 When using AOF, you can have different fsync policies:
 
 1. No fsync
-2. fsync every second <span className="badge badge--primary">Default</span>
+2. fsync every second <Badge type="primary">Default</Badge>
 3. fsync at every query
 
 With the default policy of fsync every second write performance is good enough  (fsync is performed using a background thread and the main thread will try hard to perform writes when no fsync is in progress.), **but you may lose the writes from the last second**.
@@ -135,20 +124,13 @@ After generating the AOF or RDB backup file, you can restore the data by copying
 
 If both AOF and RDB persistence are enabled, Redis will use the AOF file first on starting to recover the data because AOF is guaranteed to be the most complete data.
 
-After recovering Redis data, you can continue to use the JuiceFS file system via the new Redis address. It is recommended to run [`juicefs fsck`](../../reference/command_reference.md#juicefs-fsck) command to check the integrity of the file system data.
-
----
+After recovering Redis data, you can continue to use the JuiceFS file system via the new Redis address. It is recommended to run [`juicefs fsck`](../../reference/command_reference.mdx#fsck) command to check the integrity of the file system data.
 
 ## Recommended Managed Redis Service
 
 ### Amazon MemoryDB for Redis
 
 [Amazon MemoryDB for Redis](https://aws.amazon.com/memorydb) is a durable, in-memory database service that delivers ultra-fast performance. MemoryDB is compatible with Redis, with MemoryDB, all of your data is stored in memory, which enables you to achieve microsecond read and single-digit millisecond write latency and high throughput. MemoryDB also stores data durably across multiple Availability Zones (AZs) using a Multi-AZ transactional log to enable fast failover, database recovery, and node restarts.
-
-### Amazon ElastiCache for Redis
-
-[Amazon ElastiCache for Redis](https://aws.amazon.com/elasticache/redis) is a fully managed, Redis-compatible in-memory data store built for the cloud. It provides [automatic failover](https://docs.aws.amazon.com/AmazonElastiCache/latest/red-ug/AutoFailover.html) and [automatic backup](https://docs.aws.amazon.com/AmazonElastiCache/latest/red-ug/backups-automatic.html) features to ensure availability and durability.
-
 
 ### Google Cloud Memorystore for Redis
 
@@ -162,7 +144,102 @@ After recovering Redis data, you can continue to use the JuiceFS file system via
 
 [Alibaba Cloud ApsaraDB for Redis](https://www.alibabacloud.com/product/apsaradb-for-redis) is a database service compatible with native Redis protocols. It supports hybrid of memory and hard disks for data persistence. ApsaraDB for Redis provides a highly available hot standby architecture and are scalable to meet requirements for high-performance and low-latency read/write operations.
 
-=======
 ### Tencent Cloud TencentDB for Redis
 
 [Tencent Cloud TencentDB for Redis](https://intl.cloud.tencent.com/product/crs) is a caching and storage service compatible with the Redis protocol. It features a rich variety of data structure options to help you develop different types of business scenarios, and offers a complete set of database services such as primary-secondary hot backup, automatic switchover for disaster recovery, data backup, failover, instance monitoring, online scaling and data rollback.
+
+## Use Redis compatible product as metadata engine
+
+If you want to use a Redis compatible product as the metadata engine, you need to confirm whether the following Redis data types and commands required by JuiceFS are fully supported.
+
+### Redis data types used by JuiceFS
+
++ [String](https://redis.io/docs/data-types/strings)
++ [Set](https://redis.io/docs/data-types/sets)
++ [Sorted Set](https://redis.io/docs/data-types/sorted-sets)
++ [Hash](https://redis.io/docs/data-types/hashes)
++ [List](https://redis.io/docs/data-types/lists)
+
+### Redis features used by JuiceFS
+
++ [Pipelining](https://redis.io/docs/manual/pipelining)
+
+### Redis commands used by JuiceFS
+
+#### String
+
++ [DECRBY](https://redis.io/commands/decrby)
++ [DEL](https://redis.io/commands/del)
++ [GET](https://redis.io/commands/get)
++ [INCR](https://redis.io/commands/incr)
++ [INCRBY](https://redis.io/commands/incrby)
++ [DECR](https://redis.io/commands/decr)
++ [MGET](https://redis.io/commands/mget)
++ [MSET](https://redis.io/commands/mset)
++ [SETNX](https://redis.io/commands/setnx)
++ [SET](https://redis.io/commands/set)
+
+#### Set
+
++ [SADD](https://redis.io/commands/sadd)
++ [SMEMBERS](https://redis.io/commands/smembers)
++ [SREM](https://redis.io/commands/srem)
+
+#### Sorted Set
+
++ [ZADD](https://redis.io/commands/zadd)
++ [ZRANGEBYSCORE](https://redis.io/commands/zrangebyscore)
++ [ZRANGE](https://redis.io/commands/zrange)
++ [ZREM](https://redis.io/commands/zrem)
++ [ZSCORE](https://redis.io/commands/zscore)
+
+#### Hash
+
++ [HDEL](https://redis.io/commands/hdel)
++ [HEXISTS](https://redis.io/commands/hexists)
++ [HGETALL](https://redis.io/commands/hgetall)
++ [HGET](https://redis.io/commands/hget)
++ [HINCRBY](https://redis.io/commands/hincrby)
++ [HINCRBY](https://redis.io/commands/hincrby)
++ [HKEYS](https://redis.io/commands/hkeys)
++ [HSCAN](https://redis.io/commands/hscan)
++ [HSETNX](https://redis.io/commands/hsetnx)
++ [HSET](https://redis.io/commands/hset) (need to support setting multiple fields and values)
+
+#### List
+
++ [LLEN](https://redis.io/commands/llen)
++ [LPUSH](https://redis.io/commands/lpush)
++ [LRANGE](https://redis.io/commands/lrange)
++ [LTRIM](https://redis.io/commands/ltrim)
++ [RPUSHX](https://redis.io/commands/rpushx)
++ [RPUSH](https://redis.io/commands/rpush)
++ [SCAN](https://redis.io/commands/scan)
+
+#### Transaction
+
++ [EXEC](https://redis.io/commands/exec)
++ [MULTI](https://redis.io/commands/multi)
++ [WATCH](https://redis.io/commands/watch)
++ [UNWATCH](https://redis.io/commands/unwatch)
+
+#### Connection management
+
++ [PING](https://redis.io/commands/ping)
+
+#### Server management
+
++ [CONFIG GET](https://redis.io/commands/config-get)
++ [CONFIG SET](https://redis.io/commands/config-set)
++ [DBSIZE](https://redis.io/commands/dbsize)
++ [FLUSHDB](https://redis.io/commands/flushdb) (optional)
++ [INFO](https://redis.io/commands/info)
+
+#### Cluster management
+
++ [CLUSTER INFO](https://redis.io/commands/cluster-info)
+
+#### Scripting (optional)
+
++ [EVALSHA](https://redis.io/commands/evalsha)
++ [SCRIPT LOAD](https://redis.io/commands/script-load)

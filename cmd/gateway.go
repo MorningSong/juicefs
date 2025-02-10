@@ -20,14 +20,20 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	_ "net/http/pprof"
 	"os"
+	"os/signal"
+	"path"
 	"strconv"
-	"time"
+	"syscall"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/fs"
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/vfs"
 
 	jfsgateway "github.com/juicedata/juicefs/pkg/gateway"
@@ -35,14 +41,23 @@ import (
 
 	mcli "github.com/minio/cli"
 	minio "github.com/minio/minio/cmd"
-	"github.com/minio/minio/pkg/auth"
 )
 
 func cmdGateway() *cli.Command {
 	selfFlags := []cli.Flag{
 		&cli.StringFlag{
+			Name:  "log",
+			Usage: "path for gateway log",
+			Value: path.Join(getDefaultLogDir(), "juicefs-gateway.log"),
+		},
+		&cli.StringFlag{
 			Name:  "access-log",
 			Usage: "path for JuiceFS access log",
+		},
+		&cli.BoolFlag{
+			Name:    "background",
+			Aliases: []string{"d"},
+			Usage:   "run in background",
 		},
 		&cli.BoolFlag{
 			Name:  "no-banner",
@@ -61,13 +76,23 @@ func cmdGateway() *cli.Command {
 			Value: "022",
 			Usage: "umask for new files and directories in octal",
 		},
-	}
-
-	compoundFlags := [][]cli.Flag{
-		clientFlags(),
-		cacheFlags(0),
-		selfFlags,
-		shareInfoFlags(),
+		&cli.BoolFlag{
+			Name:  "object-tag",
+			Usage: "enable object tagging api",
+		},
+		&cli.BoolFlag{
+			Name:  "object-meta",
+			Usage: "enable object metadata api",
+		},
+		&cli.StringFlag{
+			Name:  "domain",
+			Usage: "domain for virtual-host-style requests",
+		},
+		&cli.StringFlag{
+			Name:  "refresh-iam-interval",
+			Value: "5m",
+			Usage: "interval to reload gateway IAM from configuration",
+		},
 	}
 
 	return &cli.Command{
@@ -87,7 +112,7 @@ $ export MINIO_ROOT_PASSWORD=12345678
 $ juicefs gateway redis://localhost localhost:9000
 
 Details: https://juicefs.com/docs/community/s3_gateway`,
-		Flags: expandFlags(compoundFlags),
+		Flags: expandFlags(selfFlags, clientFlags(0), shareInfoFlags()),
 	}
 }
 
@@ -107,11 +132,48 @@ func gateway(c *cli.Context) error {
 	if len(sk) < 8 {
 		logger.Fatalf("MINIO_ROOT_PASSWORD should be specified as an environment variable with at least 8 characters")
 	}
+	if c.IsSet("domain") {
+		os.Setenv("MINIO_DOMAIN", c.String("domain"))
+	}
 
-	address := c.Args().Get(1)
-	gw = &GateWay{c}
+	if c.IsSet("refresh-iam-interval") {
+		os.Setenv("MINIO_REFRESH_IAM_INTERVAL", c.String("refresh-iam-interval"))
+	}
 
-	args := []string{"gateway", "--address", address, "--anonymous"}
+	metaAddr := c.Args().Get(0)
+	listenAddr := c.Args().Get(1)
+	conf, jfs := initForSvc(c, "s3gateway", metaAddr, listenAddr)
+
+	umask, err := strconv.ParseUint(c.String("umask"), 8, 16)
+	if err != nil {
+		logger.Fatalf("invalid umask %s: %s", c.String("umask"), err)
+	}
+
+	jfsGateway, err = jfsgateway.NewJFSGateway(
+		jfs,
+		conf,
+		&jfsgateway.Config{
+			MultiBucket:   c.Bool("multi-buckets"),
+			KeepEtag:      c.Bool("keep-etag"),
+			Umask:         uint16(umask),
+			ObjTag:        c.Bool("object-tag"),
+			ObjMeta:       c.Bool("object-meta"),
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if c.IsSet("read-only") {
+		os.Setenv("JUICEFS_META_READ_ONLY", "1")
+	} else {
+		if _, err := jfsGateway.GetBucketInfo(context.Background(), minio.MinioMetaBucket); errors.As(err, &minio.BucketNotFound{}) {
+			if err := jfsGateway.MakeBucketWithLocation(context.Background(), minio.MinioMetaBucket, minio.BucketOptions{}); err != nil {
+				logger.Fatalf("init MinioMetaBucket error %s: %s", minio.MinioMetaBucket, err)
+			}
+		}
+	}
+
+	args := []string{"server", "--address", listenAddr, "--anonymous"}
 	if c.Bool("no-banner") {
 		args = append(args, "--quiet")
 	}
@@ -140,63 +202,33 @@ func gateway(c *cli.Context) error {
 	return app.Run(args)
 }
 
-var gw *GateWay
+var jfsGateway minio.ObjectLayer
 
 func gateway2(ctx *mcli.Context) error {
-	minio.StartGateway(ctx, gw)
+	minio.ServerMainForJFS(ctx, jfsGateway)
 	return nil
 }
 
-type GateWay struct {
-	ctx *cli.Context
-}
-
-func (g *GateWay) Name() string {
-	return "JuiceFS"
-}
-
-func (g *GateWay) Production() bool {
-	return true
-}
-
-func (g *GateWay) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) {
-	c := g.ctx
-	addr := c.Args().Get(0)
-	conf, jfs := initForSvc(c, "s3gateway", addr)
-
-	umask, err := strconv.ParseUint(c.String("umask"), 8, 16)
-	if err != nil {
-		logger.Fatalf("invalid umask %s: %s", c.String("umask"), err)
-	}
-
-	return jfsgateway.NewJFSGateway(
-		jfs,
-		conf,
-		&jfsgateway.Config{
-			MultiBucket: c.Bool("multi-buckets"),
-			KeepEtag: c.Bool("keep-etag"),
-			Mode: uint16(0666 &^ umask),
-			DirMode: uint16(0777 &^ umask),
-		},
-	)
-}
-
-func initForSvc(c *cli.Context, mp string, metaUrl string) (*vfs.Config, *fs.FileSystem) {
+func initForSvc(c *cli.Context, mp string, metaUrl, listenAddr string) (*vfs.Config, *fs.FileSystem) {
 	removePassword(metaUrl)
 	metaConf := getMetaConf(c, mp, c.Bool("read-only"))
 	metaCli := meta.NewClient(metaUrl, metaConf)
+	if c.Bool("background") {
+		if err := makeDaemonForSvc(c, metaCli, metaUrl, listenAddr); err != nil {
+			logger.Fatalf("make daemon: %s", err)
+		}
+	}
+
 	format, err := metaCli.Load(true)
 	if err != nil {
 		logger.Fatalf("load setting: %s", err)
 	}
-	registerer, registry := wrapRegister(mp, format.Name)
-	if !c.Bool("writeback") && c.IsSet("upload-delay") {
-		logger.Warnf("delayed upload only work in writeback mode")
+	if st := metaCli.Chroot(meta.Background(), metaConf.Subdir); st != 0 {
+		logger.Fatalf("Chroot to %s: %s", metaConf.Subdir, st)
 	}
+	registerer, registry := wrapRegister(c, mp, format.Name)
 
-	blob, err := NewReloadableStorage(format, func() (*meta.Format, error) {
-		return getFormat(c, metaCli)
-	})
+	blob, err := NewReloadableStorage(format, metaCli, updateFormat(c))
 	if err != nil {
 		logger.Fatalf("object storage: %s", err)
 	}
@@ -206,16 +238,33 @@ func initForSvc(c *cli.Context, mp string, metaUrl string) (*vfs.Config, *fs.Fil
 	store := chunk.NewCachedStore(blob, *chunkConf, registerer)
 	registerMetaMsg(metaCli, store, chunkConf)
 
-	err = metaCli.NewSession()
+	err = metaCli.NewSession(true)
 	if err != nil {
 		logger.Fatalf("new session: %s", err)
 	}
+	metaCli.OnReload(func(fmt *meta.Format) {
+		updateFormat(c)(fmt)
+		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
+	})
 
+	// Go will catch all the signals
+	signal.Ignore(syscall.SIGPIPE)
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	go func() {
+		sig := <-signalChan
+		logger.Infof("Received signal %s, exiting...", sig.String())
+		if err := metaCli.CloseSession(); err != nil {
+			logger.Fatalf("close session failed: %s", err)
+		}
+		object.Shutdown(blob)
+		os.Exit(0)
+	}()
 	vfsConf := getVfsConf(c, metaConf, format, chunkConf)
 	vfsConf.AccessLog = c.String("access-log")
-	vfsConf.AttrTimeout = time.Millisecond * time.Duration(c.Float64("attr-cache")*1000)
-	vfsConf.EntryTimeout = time.Millisecond * time.Duration(c.Float64("entry-cache")*1000)
-	vfsConf.DirEntryTimeout = time.Millisecond * time.Duration(c.Float64("dir-entry-cache")*1000)
+	vfsConf.AttrTimeout = utils.Duration(c.String("attr-cache"))
+	vfsConf.EntryTimeout = utils.Duration(c.String("entry-cache"))
+	vfsConf.DirEntryTimeout = utils.Duration(c.String("dir-entry-cache"))
 
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
 	jfs, err := fs.NewFileSystem(vfsConf, metaCli, store)

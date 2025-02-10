@@ -1,10 +1,8 @@
 ---
-sidebar_label: 在阿里云使用 JuiceFS
-sidebar_position: 4
+title: 在阿里云使用 JuiceFS
+sidebar_position: 7
 slug: /clouds/aliyun
 ---
-
-# 在阿里云安装和使用 JuiceFS 存储
 
 如下图所示，JuiceFS 存储由数据库和对象存储共同驱动。存入 JuiceFS 的文件会按照一定的规则被拆分成固定大小的数据块存储在对象存储中，数据对应的元数据则会存储在数据库中。
 
@@ -12,7 +10,7 @@ slug: /clouds/aliyun
 
 这样的设计可以有效缩减对象存储在请求数量上的费用，同时也能让我们显著感受到 JuiceFS 带来的性能提升。
 
-![](../images/juicefs-aliyun.png)
+![JuiceFS-aliyun](../images/juicefs-aliyun.png)
 
 ## 准备
 
@@ -42,30 +40,30 @@ JuiceFS 默认会占用不超过 1GB 的硬盘空间作为缓存，可以根据�
 
 ### 二、云数据库
 
-JuiceFS 会将数据对应的元数据全部存储在独立的数据库中，目前已开放支持的数据库有 Redis、MySQL、PostgreSQL 和 SQLite。
+JuiceFS 会将数据对应的元数据全部存储在独立的数据库中，目前已开放支持的数据库有 Redis、MySQL、PostgreSQL、SQLite，以及 OceanBase。
 
-根据数据库类型的不同，带来的元数据性能和可靠性表现也各不相同。比如 Redis 是完全运行在内存上的，它能提供极致的性能，但运维难度较高，可靠性相对低。而 MySQL、PostgreSQL 是关系型数据库，性能不如 Redis，但运维难度不高，可靠性也有一定的保障。SQLite 是单机单文件关系型数据库，性能较低，也不适合用于大规模数据存储，但它免配置，适合单机少量数据存储的场景。
+根据数据库类型的不同，带来的元数据性能和可靠性表现也各不相同。比如 Redis 是完全运行在内存上的，它能提供极致的性能，但运维难度较高，可靠性相对低。而 MySQL、PostgreSQL 是关系型数据库，性能不如 Redis，但运维难度不高，可靠性也有一定的保障。SQLite 是单机单文件关系型数据库，性能较低，也不适合用于大规模数据存储，但它免配置，适合单机少量数据存储的场景。相比之下，OceanBase 是一款分布式关系型数据库，能够在提供高性能的同时，确保数据的一致性和高可靠性（RTO < 8s）。它特别适合金融、零售、电信等对事务一致性和分布式能力要求较高的场景，使 JuiceFS 在处理海量元数据时可以实现更高效率、更低延迟和更强稳定性，从而满足现代分布式存储系统对底层数据库的苛刻要求。
 
-如果只是为了评估 JuiceFS 的功能，你可以在 ECS 云服务器手动搭建数据库使用。当你要在生产环境使用 JucieFS 时，如果没有专业的数据库运维团队，阿里云的云数据库服务通常是更好的选择。
+如果只是为了评估 JuiceFS 的功能，你可以在 ECS 云服务器手动搭建数据库使用。当你要在生产环境使用 JuiceFS 时，如果没有专业的数据库运维团队，阿里云的云数据库服务通常是更好的选择。
 
 当然，如果你愿意，也可以使用其他云平台上提供的云数据库服务。但在这种情况下，你只能通过公网访问云数据库，也就是说，你必须向公网暴露数据库的端口，这存在极大的安全风险，最好不要这样使用。
 
 如果必须通过公网访问数据库，可以通过云数据库控台提供的白名单功能，严格限制允许访问数据库的 IP 地址，从而提升数据的安全性。从另一个角度说，如果你通过公网无法成功连接云数据库，那么可以检查数据库的白名单，检查是不是该设置限制了你的访问。
 
-|    数据库    |          Redis           |     MySQL、PostgreSQL      |         SQLite         |
-| :----------: | :----------------------: | :------------------------: | :--------------------: |
-|   **性能**   |            强            |            适中            |           弱           |
-| **运维门槛** |            高            |            适中            |           低           |
-|  **可靠性**  |            低            |            适中            |           低           |
-| **应用场景** | 海量数据、分布式高频读写 | 海量数据、分布式中低频读写 | 少量数据单机中低频读写 |
+|    数据库    |          Redis           |     MySQL、PostgreSQL      |         SQLite         |        OceanBase        |
+| :----------: | :----------------------: | :------------------------: | :--------------------: | :---------------------: |
+|   **性能**   |            强            |            适中            |           弱           |           强            |
+| **运维门槛** |            高            |            适中            |           低           |           适中          |
+|  **可靠性**  |            低            |            适中            |           低           |           高            |
+| **应用场景** | 海量数据、分布式高频读写 | 海量数据、分布式中低频读写 | 少量数据单机中低频读写 | 分布式场景、强事务一致性、高可靠性要求 |
 
 **本文使用了[云数据 Redis 版](https://www.aliyun.com/product/kvstore)，以下连接地址只是为了演示目的编制的伪地址：**
 
-| Redis 版本   | 5.0 社区版                           |
-| ------------ | ------------------------------------ |
+| Redis 版本   | 5.0 社区版                             |
+|--------------|----------------------------------------|
 | **实例规格** | 256M 标准版 - 单副本                   |
-| **连接地址** | herald-sh-abc.redis.rds.aliyuncs.com |
-| **可用区**   | 上海                                 |
+| **连接地址** | `herald-sh-abc.redis.rds.aliyuncs.com` |
+| **可用区**   | 上海                                   |
 
 ### 三、对象存储 OSS
 
@@ -83,27 +81,13 @@ JuiceFS 会将所有的数据都存储到对象存储中，它支持几乎所有
 
 ## 安装
 
-我们当前使用的是 Ubuntu Server 20.04 64 位系统，依次执行以下命令可以下载最新版本客户端。你也可以访问 [JuiceFS GitHub Releases](https://github.com/juicedata/juicefs/releases) 页面选择其他版本。
+当前使用的是 Ubuntu Server 20.04 64 位系统，依次执行以下命令可以安装最新版本客户端。
 
 ```shell
-JFS_LATEST_TAG=$(curl -s https://api.github.com/repos/juicedata/juicefs/releases/latest | grep 'tag_name' | cut -d '"' -f 4 | tr -d 'v')
+curl -sSL https://d.juicefs.com/install | sh -
 ```
 
-```shell
-wget "https://github.com/juicedata/juicefs/releases/download/v${JFS_LATEST_TAG}/juicefs-${JFS_LATEST_TAG}-linux-amd64.tar.gz"
-```
-
-下载完成以后，解压程序到 `juice` 文件夹：
-
-```shell
-mkdir juice && tar -zxvf "juicefs-${JFS_LATEST_TAG}-linux-amd64.tar.gz" -C juice
-```
-
-将 JuiceFS 客户端安装到 `/usr/local/bin` ：
-
-```shell
-sudo install juice/juicefs /usr/local/bin
-```
+你也可以访问 [JuiceFS GitHub Releases](https://github.com/juicedata/juicefs/releases) 页面选择其他版本。
 
 执行命令，看到返回 `juicefs` 的命令帮助信息，代表客户端安装成功。
 
@@ -140,7 +124,7 @@ GLOBAL OPTIONS:
    --verbose, --debug, -v  enable debug log (default: false)
    --quiet, -q             only warning and errors (default: false)
    --trace                 enable trace log (default: false)
-   --no-agent              Disable pprof (:6060) and gops (:6070) agent (default: false)
+   --no-agent              disable pprof (:6060) agent (default: false)
    --help, -h              show help (default: false)
    --version, -V           print only the version (default: false)
 
@@ -160,30 +144,30 @@ JuiceFS 客户端安装好以后，现在就可以使用前面准备好的 Redis
 
 ```shell
 $ juicefs format \
-	--storage oss \
-	--bucket https://<your-bucket-name> \
-	--access-key <your-access-key-id> \
-	--secret-key <your-access-key-secret> \
-	redis://:<your-redis-password>@herald-sh-abc.redis.rds.aliyuncs.com:6379/1 \
-	mystor
+    --storage oss \
+    --bucket https://<your-bucket-name> \
+    --access-key <your-access-key-id> \
+    --secret-key <your-access-key-secret> \
+    redis://:<your-redis-password>@herald-sh-abc.redis.rds.aliyuncs.com:6379/1 \
+    mystor
 ```
 
 **选项说明：**
 
-- `--storage`：指定对象存储类型，[点此查看](../guide/how_to_set_up_object_storage.md#%E6%94%AF%E6%8C%81%E7%9A%84%E5%AD%98%E5%82%A8%E6%9C%8D%E5%8A%A1) JuiceFS 支持的对象存储。
+- `--storage`：指定对象存储类型，[点此查看](../reference/how_to_set_up_object_storage.md#supported-object-storage) JuiceFS 支持的对象存储。
 - `--bucket`：对象存储的 Bucket 域名。当使用阿里云 OSS 时，只需填写 bucket 名称即可，无需填写完整的域名，JuiceFS 会自动识别并补全地址。
 - `--access-key` 和 `--secret-key`：访问对象存储 API 的秘钥对，[点此查看](https://help.aliyun.com/document_detail/38738.html)获取方式。
 
 > Redis 6.0 身份认证需要用户名和密码两个参数，地址格式为 `redis://username:password@redis-server-url:6379/1`。目前阿里云数据库 Redis 版只提供 Reids 4.0 和 5.0 两个版本，认证身份只需要密码，在设置 Redis 服务器地址时只需留空用户名即可，例如：`redis://:password@redis-server-url:6379/1`
 
-使用 RAM 角色绑定 ECS 时，创建 JucieFS 存储只需指定 `--storage` 和  `--bucket` 两个选项，无需提供 API 访问秘钥。命令可以改写成：
+使用 RAM 角色绑定 ECS 时，创建 JuiceFS 存储只需指定 `--storage` 和  `--bucket` 两个选项，无需提供 API 访问秘钥。命令可以改写成：
 
 ```shell
 $ juicefs format \
-	--storage oss \
-	--bucket https://mytest.oss-cn-shanghai.aliyuncs.com \
-	redis://:<your-redis-password>@herald-sh-abc.redis.rds.aliyuncs.com:6379/1 \
-	mystor
+    --storage oss \
+    --bucket https://mytest.oss-cn-shanghai.aliyuncs.com \
+    redis://:<your-redis-password>@herald-sh-abc.redis.rds.aliyuncs.com:6379/1 \
+    mystor
 ```
 
 看到类似下面的输出，代表文件系统创建成功了。
@@ -280,22 +264,4 @@ sudo juicefs umount /mnt/jfs
 
 ## 开机自动挂载
 
-如果你不想每次重启系统都要重新手动挂载 JuiceFS 存储，可以设置自动挂载文件系统。
-
-首先，需要将  `juicefs` 客户端重命名为 `mount.juicefs` 并复制到 `/sbin/` 目录：
-
-```shell
-sudo cp juice/juicefs /sbin/mount.juicefs
-```
-
-编辑 `/etc/fstab` 配置文件，新增一条记录：
-
-```shell
-redis://:<your-redis-password>@herald-sh-abc.redis.rds.aliyuncs.com:6379/1    /mnt/jfs       juicefs     _netdev,cache-size=20480     0  0
-```
-
-挂载选项中 `cache-size=20480` 代表分配 20GB 本地磁盘空间作为 JuiceFS 的缓存使用，请根据你实际的 ECS 硬盘容量去决定分配的缓存大小。一般来说，为 JuiceFS 分配更大的缓存空间，可以获得更好的性能表现。
-
-你可以根据需要调整上述配置中的 FUSE 挂载选项，更多内容请[查阅文档](../reference/fuse_mount_options.md)。
-
-> **注意**：请将上述配置文件中的 Redis 地址、挂载点以及挂载选项，替换成你实际的信息。
+请参考[「启动时自动挂载 JuiceFS」](../administration/mount_at_boot.md)

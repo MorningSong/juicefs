@@ -1,11 +1,10 @@
 ---
-sidebar_label: 在 Rancher 上使用 JuiceFS
+title: 在 Rancher 上使用 JuiceFS
 sidebar_position: 2
 slug: /juicefs_on_rancher
 ---
-# 在 Rancher 上使用 JuiceFS
 
-简单来说，[Rancher](https://rancher.com/) 是一个企业级的 Kubernetes 集群管理工具，使用它可以非常轻松的在各种云计算平台上快速的完成 Kubernetes 集群的部署。
+简单来说，[Rancher](https://rancher.com) 是一个企业级的 Kubernetes 集群管理工具，使用它可以非常轻松的在各种云计算平台上快速的完成 Kubernetes 集群的部署。
 
 Rancher 提供了基于浏览器的管理界面，即便是 Kubernetes 经验并不丰富的用户，也能相对轻松的上手开始管理和使用。它默认预置了基于 Helm 的应用市场，可以在图形化界面下非常轻松的安装各种 Kubernetes 应用。
 
@@ -29,7 +28,7 @@ sudo docker run --privileged -d --restart=unless-stopped -p 80:80 -p 443:443 ran
 
 容器创建完成以后，通过浏览器访问主机的 IP 地址就能打开 Rancher 的管理界面。
 
-![](../images/rancher-welcome.jpeg)
+![Rancher-welcome](../images/rancher-welcome.jpeg)
 
 ## 创建 Kubernetes 集群
 
@@ -37,36 +36,36 @@ Rancher 安装成功以后，可以看到它已经在当前容器中部署了一
 
 接下来开始创建 Kubernetes 集群，在欢迎页面的 Cluster 部分点击 `Create` 创建集群。Rancher 支持在各大主流云计算平台创建 Kubernetes 集群，这里我们要在 Rancher 的宿主机上直接选择集群，因此选择 `Custom`。然后根据向导填写集群名称，选择 Kubernetes 版本即可。
 
-![](../images/rancher-cluster-create.jpg)
+![Rancher-cluster-create](../images/rancher-cluster-create.jpg)
 
 在 `Cluster Options` 页面中，选择要创建的节点角色，然后复制生成命令，在目标主机上执行即可。
 
-![](../images/rancher-cluster-options.jpg)
+![Rancher-cluster-options](../images/rancher-cluster-options.jpg)
 
 集群创建完成后，Rancher 的集群列表中会有状态显示。
 
-![](../images/rancher-clusters.jpg)
+![Rancher-clusters](../images/rancher-clusters.jpg)
 
 ## 一键安装 JuiceFS CSI Driver
 
 在集群列表中点击进入创建的 Kubernetes 集群，左侧导航菜单点击展开 `应用市场` → `Chart 仓库`，点击 `创建` 按钮添加 JuiceFS CSI 仓库，填写：
 
-- **仓库名称**：juicefs
-- **Index URL**：https://juicedata.github.io/juicefs-csi-driver/
+- **仓库名称**：`juicefs`
+- **Index URL**：`https://juicedata.github.io/charts/`
 
-![](../images/rancher-new-repo.jpg)
+![Rancher-new-repo](../images/rancher-new-repo.jpg)
 
 创建以后，在仓库列表中可以看到刚刚添加的 JuiceFS CSI 仓库。
 
-![](../images/rancher-repos.jpg)
+![Rancher-repos](../images/rancher-repos.jpg)
 
 紧接着通过左侧菜单点击打开 `应用市场` → `Charts`，搜索栏中输入 `juicefs`，然后点击打开检索出的 `juicefs-csi-driver`。
 
-![](../images/rancher-chart-search.jpg)
+![Rancher-chart-search](../images/rancher-chart-search.jpg)
 
 在应用详情页面点击“安装”按钮，默认会安装最新版本，也可以点选切换到历史版本进行安装。
 
-![](../images/rancher-chart-info.jpg)
+![Rancher-chart-info](../images/rancher-chart-info.jpg)
 
 安装向导共有两步：
 
@@ -76,7 +75,7 @@ JuiceFS CSI Driver 默认为 `kube-system`，这一步无需设置。
 
 ### 第二步：调整配置参数
 
-这个页面提供了 YAML 编辑器，你可以根据需要调整 JuiceFS 相关的信息，通常只需要修改 `storageClasses` 部分，其中 `backend` 部分用来定义文件系统后端的数据库和对象存储，可以查阅[「JuiceFS 快速上手指南」](../getting-started/README.md)了解相关内容。如果你使用的是已经预先创建的文件系统，那么只需填写 `metaurl` 和 `name` 两项即可，例如：
+这个页面提供了 YAML 编辑器，你可以根据需要调整 JuiceFS 相关的信息，通常只需要修改 `storageClasses` 部分，其中 `backend` 部分用来定义文件系统后端的数据库和对象存储。如果你使用的是已经预先创建的文件系统，那么只需填写 `metaurl` 和 `name` 两项即可，例如：
 
 ```yaml
 ...
@@ -98,10 +97,10 @@ storageClasses:
 
 点击「安装」，等待应用安装完成。
 
-![](../images/rancher-chart-installed.jpg)
+![Rancher-chart-installed](../images/rancher-chart-installed.jpg)
 
 ## 使用 JuiceFS 持久化数据
 
 部署应用时，在存储配置中指定 `juicefs-sc` 即可。
 
-![](../images/rancher-pvc.jpg)
+![Rancher-PVC](../images/rancher-pvc.jpg)

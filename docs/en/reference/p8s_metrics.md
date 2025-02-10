@@ -1,40 +1,28 @@
 ---
-sidebar_label: JuiceFS Metrics
-sidebar_position: 2
-slug: /p8s_metrics
+title: JuiceFS Metrics
+sidebar_position: 4
 ---
 
-# JuiceFS Metrics
+If you haven't yet set up monitoring for JuiceFS, read [monitoring and data visualization"](../administration/monitoring.md) to learn how.
 
-:::tip
-Please see the ["Monitoring"](../administration/monitoring.md) documentation to learn how to collect and display JuiceFS monitoring metrics.
-:::
-
-## Global labels
+## Global labels {#global-labels}
 
 | Name       | Description      |
 | ----       | -----------      |
 | `vol_name` | Volume name      |
-| `mp`       | Mount point path |
+| `instance` | Client host name in format `<host>:<port>`. Refer to [official document](https://prometheus.io/docs/concepts/jobs_instances) for more information |
+| `mp`       | Mount point path, if metrics are reported through [Prometheus Pushgateway](https://github.com/prometheus/pushgateway), for example, [JuiceFS Hadoop Java SDK](../administration/monitoring.md#hadoop), `mp` will be `sdk-<PID>` |
 
-:::info
-When Prometheus scrapes a target, it attaches `instance` label automatically to the scraped time series which serve to identify the scraped target, and its format is `<host>:<port>`. Refer to [official document](https://prometheus.io/docs/concepts/jobs_instances) for more information.
-:::
-
-:::info
-If the monitoring metrics are reported through [Prometheus Pushgateway](https://github.com/prometheus/pushgateway) (for example, [JuiceFS Hadoop Java SDK](../administration/monitoring.md#hadoop)), the value of the `mp` label is `sdk-<PID>`, and the value of the `instance` label is the host name.
-:::
-
-## File system
+## File system {#file-system}
 
 ### Metrics
 
-| Name                  | Description            | Unit |
-| ----                  | -----------            | ---- |
-| `juicefs_used_space`  | Total used space       | byte |
-| `juicefs_used_inodes` | Total number of inodes |      |
+| Name                          | Description                            | Unit |
+|-------------------------------|----------------------------------------|------|
+| `juicefs_used_space`          | Total used space                       | byte |
+| `juicefs_used_inodes`         | Total number of inodes                 |      |
 
-## Operating system
+## Operating system {#operating-system}
 
 ### Metrics
 
@@ -44,7 +32,7 @@ If the monitoring metrics are reported through [Prometheus Pushgateway](https://
 | `juicefs_cpu_usage` | Accumulated CPU usage | second |
 | `juicefs_memory`    | Used memory           | byte   |
 
-## Metadata engine
+## Metadata engine {#metadata-engine}
 
 ### Metrics
 
@@ -53,7 +41,7 @@ If the monitoring metrics are reported through [Prometheus Pushgateway](https://
 | `juicefs_transaction_durations_histogram_seconds` | Transactions latency distributions         | second |
 | `juicefs_transaction_restart`                     | Number of times a transaction restarted |        |
 
-## FUSE
+## FUSE {#fuse}
 
 ### Metrics
 
@@ -64,7 +52,7 @@ If the monitoring metrics are reported through [Prometheus Pushgateway](https://
 | `juicefs_fuse_ops_durations_histogram_seconds` | Operations latency distributions     | second |
 | `juicefs_fuse_open_handlers`                   | Number of open files and directories |        |
 
-## SDK
+## SDK {#sdk}
 
 ### Metrics
 
@@ -74,12 +62,12 @@ If the monitoring metrics are reported through [Prometheus Pushgateway](https://
 | `juicefs_sdk_written_size_bytes`              | Size distributions of write request | byte   |
 | `juicefs_sdk_ops_durations_histogram_seconds` | Operations latency distributions    | second |
 
-## Cache
+## Cache {#cache}
 
 ### Metrics
 
 | Name                                    | Description                                 | Unit   |
-| ----                                    | -----------                                 | ----   |
+|:----------------------------------------|---------------------------------------------|--------|
 | `juicefs_blockcache_blocks`             | Number of cached blocks                     |        |
 | `juicefs_blockcache_bytes`              | Size of cached blocks                       | byte   |
 | `juicefs_blockcache_hits`               | Count of cached block hits                  |        |
@@ -92,8 +80,11 @@ If the monitoring metrics are reported through [Prometheus Pushgateway](https://
 | `juicefs_blockcache_write_bytes`        | Size of cached block writes                 | byte   |
 | `juicefs_blockcache_read_hist_seconds`  | Latency distributions of read cached block  | second |
 | `juicefs_blockcache_write_hist_seconds` | Latency distributions of write cached block | second |
+| `juicefs_staging_blocks`                | Number of blocks in the staging path        |        |
+| `juicefs_staging_block_bytes`           | Total bytes of blocks in the staging path   | byte   |
+| `juicefs_staging_block_delay_seconds`   | Total seconds of delay for staging blocks   | second |
 
-## Object storage
+## Object storage {#object-storage}
 
 ### Labels
 
@@ -109,10 +100,28 @@ If the monitoring metrics are reported through [Prometheus Pushgateway](https://
 | `juicefs_object_request_errors`                      | Count of failed requests to object storage   |        |
 | `juicefs_object_request_data_bytes`                  | Size of requests to object storage           | byte   |
 
-## Internal
+## Internal {#internal}
 
 ### Metrics
 
 | Name                                   | Description                          | Unit |
-| ----                                   | -----------                          | ---- |
+|----------------------------------------| -----------                          | ---- |
 | `juicefs_compact_size_histogram_bytes` | Size distributions of compacted data | byte |
+| `juicefs_used_read_buffer_size_bytes`  | size of currently used buffer for read |      |
+
+## Data synchronization {#sync}
+
+### Metrics
+
+| Name | Description | Unit |
+|-|-|-|
+| `juicefs_sync_scanned` | Number of all objects scanned from the source | |
+| `juicefs_sync_handled` | Number of objects from the source that have been processed | |
+| `juicefs_sync_pending` | Number of objects waiting to be synchronized | |
+| `juicefs_sync_copied` | Number of objects that have been synchronized | |
+| `juicefs_sync_copied_bytes` | Total size of data that has been synchronized | byte |
+| `juicefs_sync_skipped` | Number of objects that skipped during synchronization | |
+| `juicefs_sync_failed` | Number of objects that failed during synchronization | |
+| `juicefs_sync_deleted` | Number of objects that deleted during synchronization | |
+| `juicefs_sync_checked` | Number of objects that have been verified by checksum during synchronization | |
+| `juicefs_sync_checked_bytes` | Total size of data that has been verified by checksum during synchronization | byte |

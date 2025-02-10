@@ -28,9 +28,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"os"
 	"strings"
 
+	"github.com/youmark/pkcs8"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -62,46 +63,62 @@ func ExportRsaPrivateKeyToPem(key *rsa.PrivateKey, passphrase string) string {
 	return string(privPEM)
 }
 
-func ParseRsaPrivateKeyFromPem(block *pem.Block, passphrase string) (*rsa.PrivateKey, error) {
+func ParseRsaPrivateKeyFromPem(enc []byte, passphrase []byte) (*rsa.PrivateKey, error) {
+	block, _ := pem.Decode(enc)
+	if block == nil {
+		return nil, errors.New("failed to parse PEM block containing the key")
+	}
 	buf := block.Bytes
-	if passphrase != "" {
+	if len(passphrase) != 0 {
 		var err error
 		// nolint:staticcheck
-		buf, err = x509.DecryptPEMBlock(block, []byte(passphrase))
+		buf, err = x509.DecryptPEMBlock(block, passphrase)
 		if err != nil {
 			if err == x509.IncorrectPasswordError {
 				return nil, err
 			}
-			return nil, fmt.Errorf("cannot decode encrypted private keys: %v", err)
+			privKey, err := pkcs8.ParsePKCS8PrivateKeyRSA(block.Bytes, passphrase)
+			if err == nil {
+				return privKey, nil
+			}
+			privKey, err = pkcs8.ParsePKCS8PrivateKeyRSA(block.Bytes, nil)
+			if err == nil {
+				return privKey, nil
+			}
+			if !strings.Contains(err.Error(), "ParsePKCS1PrivateKey") {
+				return nil, fmt.Errorf("cannot decode encrypted private keys: %v", err)
+			}
+			buf = block.Bytes
 		}
 	}
 
 	priv, err := x509.ParsePKCS1PrivateKey(buf)
+	if err == nil {
+		return priv, nil
+	}
+	key, err := x509.ParsePKCS8PrivateKey(buf)
 	if err != nil {
 		return nil, err
 	}
-
-	return priv, nil
+	if priv, ok := key.(*rsa.PrivateKey); ok {
+		return priv, nil
+	}
+	return nil, fmt.Errorf("is not RSA private key")
 }
 
 func ParseRsaPrivateKeyFromPath(path, passphrase string) (*rsa.PrivateKey, error) {
-	b, err := ioutil.ReadFile(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	block, _ := pem.Decode(b)
-	if block == nil {
-		return nil, errors.New("failed to parse PEM block containing the key")
-	}
-	// nolint:staticcheck
-	if strings.Contains(block.Headers["Proc-Type"], "ENCRYPTED") && x509.IsEncryptedPEMBlock(block) {
-		if passphrase == "" {
+	if passphrase == "" {
+		block, _ := pem.Decode(b)
+		// nolint:staticcheck
+		if block != nil && strings.Contains(block.Headers["Proc-Type"], "ENCRYPTED") && x509.IsEncryptedPEMBlock(block) {
 			return nil, fmt.Errorf("passphrase is required to private key, please try again after setting the 'JFS_RSA_PASSPHRASE' environment variable")
 		}
-	} else if passphrase != "" {
-		logger.Warningf("passphrase is not used, because private key is not encrypted")
 	}
-	return ParseRsaPrivateKeyFromPem(block, passphrase)
+	return ParseRsaPrivateKeyFromPem(b, []byte(passphrase))
 }
 
 func NewRSAEncryptor(privKey *rsa.PrivateKey) Encryptor {
@@ -212,13 +229,13 @@ func (e *encrypted) String() string {
 	return fmt.Sprintf("%s(encrypted)", e.ObjectStorage)
 }
 
-func (e *encrypted) Get(key string, off, limit int64) (io.ReadCloser, error) {
-	r, err := e.ObjectStorage.Get(key, 0, -1)
+func (e *encrypted) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
+	r, err := e.ObjectStorage.Get(key, 0, -1, getters...)
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
-	ciphertext, err := ioutil.ReadAll(r)
+	ciphertext, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}
@@ -234,11 +251,11 @@ func (e *encrypted) Get(key string, off, limit int64) (io.ReadCloser, error) {
 		limit = l - off
 	}
 	data := plain[off : off+limit]
-	return ioutil.NopCloser(bytes.NewBuffer(data)), nil
+	return io.NopCloser(bytes.NewBuffer(data)), nil
 }
 
-func (e *encrypted) Put(key string, in io.Reader) error {
-	plain, err := ioutil.ReadAll(in)
+func (e *encrypted) Put(key string, in io.Reader, getters ...AttrGetter) error {
+	plain, err := io.ReadAll(in)
 	if err != nil {
 		return err
 	}
@@ -246,7 +263,7 @@ func (e *encrypted) Put(key string, in io.Reader) error {
 	if err != nil {
 		return err
 	}
-	return e.ObjectStorage.Put(key, bytes.NewReader(ciphertext))
+	return e.ObjectStorage.Put(key, bytes.NewReader(ciphertext), getters...)
 }
 
 var _ ObjectStorage = &encrypted{}

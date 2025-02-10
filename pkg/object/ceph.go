@@ -45,6 +45,10 @@ func (c *ceph) String() string {
 	return fmt.Sprintf("ceph://%s/", c.name)
 }
 
+func (c *ceph) Shutdown() {
+	c.conn.Shutdown()
+}
+
 func (c *ceph) Create() error {
 	names, err := c.conn.ListPools()
 	if err != nil {
@@ -63,7 +67,11 @@ func (c *ceph) newContext() (*rados.IOContext, error) {
 	case ctx := <-c.free:
 		return ctx, nil
 	default:
-		return c.conn.OpenIOContext(c.name)
+		ctx, err := c.conn.OpenIOContext(c.name)
+		if err == nil {
+			_ = ctx.SetPoolFullTry()
+		}
+		return ctx, err
 	}
 }
 
@@ -98,6 +106,9 @@ type cephReader struct {
 }
 
 func (r *cephReader) Read(buf []byte) (n int, err error) {
+	if r.limit == 0 {
+		return 0, io.EOF
+	}
 	if r.limit > 0 && int64(len(buf)) > r.limit {
 		buf = buf[:r.limit]
 	}
@@ -120,7 +131,10 @@ func (r *cephReader) Close() error {
 	return nil
 }
 
-func (c *ceph) Get(key string, off, limit int64) (io.ReadCloser, error) {
+func (c *ceph) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
+	if _, err := c.Head(key); err != nil {
+		return nil, err
+	}
 	ctx, err := c.newContext()
 	if err != nil {
 		return nil, err
@@ -134,12 +148,19 @@ var cephPool = sync.Pool{
 	},
 }
 
-func (c *ceph) Put(key string, in io.Reader) error {
+func (c *ceph) Put(key string, in io.Reader, getters ...AttrGetter) error {
+	// ceph default osd_max_object_size = 128M
 	return c.do(func(ctx *rados.IOContext) error {
 		if b, ok := in.(*bytes.Reader); ok {
 			v := reflect.ValueOf(b)
 			data := v.Elem().Field(0).Bytes()
-			return ctx.WriteFull(key, data)
+			if len(data) == 0 {
+				return notSupported
+			}
+			// If the data exceeds 90M, ceph will report an error: 'rados: ret=-90, Message too long'
+			if len(data) < 85<<20 {
+				return ctx.WriteFull(key, data)
+			}
 		}
 		buf := cephPool.Get().([]byte)
 		defer cephPool.Put(buf)
@@ -153,6 +174,9 @@ func (c *ceph) Put(key string, in io.Reader) error {
 				off += uint64(n)
 			} else {
 				if err == io.EOF {
+					if off == 0 {
+						return errors.New("ceph: can't put empty file")
+					}
 					return nil
 				}
 				return err
@@ -161,10 +185,14 @@ func (c *ceph) Put(key string, in io.Reader) error {
 	})
 }
 
-func (c *ceph) Delete(key string) error {
-	return c.do(func(ctx *rados.IOContext) error {
+func (c *ceph) Delete(key string, getters ...AttrGetter) error {
+	err := c.do(func(ctx *rados.IOContext) error {
 		return ctx.Delete(key)
 	})
+	if err == rados.ErrNotFound {
+		err = nil
+	}
+	return err
 }
 
 func (c *ceph) Head(key string) (Object, error) {
@@ -174,7 +202,7 @@ func (c *ceph) Head(key string) (Object, error) {
 		if err != nil {
 			return err
 		}
-		o = &obj{key, int64(stat.Size), stat.ModTime, strings.HasSuffix(key, "/")}
+		o = &obj{key, int64(stat.Size), stat.ModTime, strings.HasSuffix(key, "/"), ""}
 		return nil
 	})
 	if err == rados.ErrNotFound {
@@ -183,47 +211,102 @@ func (c *ceph) Head(key string) (Object, error) {
 	return o, err
 }
 
-func (c *ceph) ListAll(prefix, marker string) (<-chan Object, error) {
-	var objs = make(chan Object, 1000)
-	err := c.do(func(ctx *rados.IOContext) error {
-		iter, err := ctx.Iter()
-		if err != nil {
-			close(objs)
-			return err
-		}
-		defer iter.Close()
+func (c *ceph) ListAll(prefix, marker string, followLink bool) (<-chan Object, error) {
+	ctx, err := c.newContext()
+	if err != nil {
+		return nil, err
+	}
+	iter, err := ctx.Iter()
+	if err != nil {
+		ctx.Destroy()
+		return nil, err
+	}
+	defer iter.Close()
 
-		// FIXME: this will be really slow for many objects
-		keys := make([]string, 0, 1000)
-		for iter.Next() {
-			key := iter.Value()
-			if key <= marker || !strings.HasPrefix(key, prefix) {
-				continue
-			}
-			keys = append(keys, key)
+	// FIXME: this will be really slow for many objects
+	keys := make([]string, 0, 1000)
+	for iter.Next() {
+		key := iter.Value()
+		if key <= marker || !strings.HasPrefix(key, prefix) {
+			continue
 		}
-		// the keys are not ordered, sort them first
-		sort.Strings(keys)
-		// TODO: parallel
-		go func() {
-			defer close(objs)
-			for _, key := range keys {
-				st, err := ctx.Stat(key)
+		keys = append(keys, key)
+	}
+	// the keys are not ordered, sort them first
+	sort.Strings(keys)
+	c.release(ctx)
+
+	var objs = make(chan Object, 1000)
+	var concurrent = 20
+	ms := make([]sync.Mutex, concurrent)
+	conds := make([]*sync.Cond, concurrent)
+	ready := make([]bool, concurrent)
+	results := make([]Object, concurrent)
+	errs := make([]error, concurrent)
+	for j := 0; j < concurrent; j++ {
+		conds[j] = sync.NewCond(&ms[j])
+		if j < len(keys) {
+			go func(j int) {
+				ctx, err := c.newContext()
 				if err != nil {
-					if errors.Is(err, rados.ErrNotFound) {
-						logger.Warnf("Skip non-existent key: %s", key)
-						continue
-					}
-					objs <- nil
-					logger.Errorf("Stat key %s: %s", key, err)
+					logger.Errorf("new context: %s", err)
+					errs[j] = err
 					return
 				}
-				objs <- &obj{key, int64(st.Size), st.ModTime, strings.HasSuffix(key, "/")}
+				defer ctx.Destroy()
+				for i := j; i < len(keys); i += concurrent {
+					key := keys[i]
+					st, err := ctx.Stat(key)
+					if err != nil {
+						if errors.Is(err, rados.ErrNotFound) {
+							logger.Debugf("Skip non-existent key: %s", key)
+							results[j] = nil
+						} else {
+							logger.Errorf("Stat key %s: %s", key, err)
+							errs[j] = err
+						}
+					} else {
+						results[j] = &obj{key, int64(st.Size), st.ModTime, strings.HasSuffix(key, "/"), ""}
+					}
+
+					ms[j].Lock()
+					ready[j] = true
+					conds[j].Signal()
+					if errs[j] != nil {
+						ms[j].Unlock()
+						break
+					}
+					for ready[j] {
+						conds[j].Wait()
+					}
+					ms[j].Unlock()
+				}
+			}(j)
+		}
+	}
+	go func() {
+		defer close(objs)
+		for i := range keys {
+			j := i % concurrent
+			ms[j].Lock()
+			for !ready[j] {
+				conds[j].Wait()
 			}
-		}()
-		return nil
-	})
-	return objs, err
+			if errs[j] != nil {
+				objs <- nil
+				ms[j].Unlock()
+				// some goroutines will be leaked, but it's ok
+				// since we won't call ListAll() many times in a process
+				break
+			} else if results[j] != nil {
+				objs <- results[j]
+			}
+			ready[j] = false
+			conds[j].Signal()
+			ms[j].Unlock()
+		}
+	}()
+	return objs, nil
 }
 
 func newCeph(endpoint, cluster, user, token string) (ObjectStorage, error) {
@@ -238,6 +321,22 @@ func newCeph(endpoint, cluster, user, token string) (ObjectStorage, error) {
 	conn, err := rados.NewConnWithClusterAndUser(cluster, user)
 	if err != nil {
 		return nil, fmt.Errorf("Can't create connection to cluster %s for user %s: %s", cluster, user, err)
+	}
+	if opt := os.Getenv("CEPH_ADMIN_SOCKET"); opt != "none" {
+		if opt == "" {
+			opt = "$run_dir/jfs-$cluster-$name-$pid.asok"
+		}
+		if err = conn.SetConfigOption("admin_socket", opt); err != nil {
+			logger.Warnf("Failed to set admin_socket to %s: %s", opt, err)
+		}
+	}
+	if opt := os.Getenv("CEPH_LOG_FILE"); opt != "none" {
+		if opt == "" {
+			opt = "/var/log/ceph/jfs-$cluster-$name.log"
+		}
+		if err = conn.SetConfigOption("log_file", opt); err != nil {
+			logger.Warnf("Failed to set log_file to %s: %s", opt, err)
+		}
 	}
 	if os.Getenv("JFS_NO_CHECK_OBJECT_STORAGE") == "" {
 		if err := conn.ReadDefaultConfigFile(); err != nil {

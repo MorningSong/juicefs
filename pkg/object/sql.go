@@ -25,14 +25,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
-	_ "github.com/lib/pq"
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/sirupsen/logrus"
 	"xorm.io/xorm"
 	"xorm.io/xorm/log"
@@ -47,18 +44,22 @@ type sqlStore struct {
 
 type blob struct {
 	Id       int64     `xorm:"pk bigserial"`
-	Key      string    `xorm:"notnull unique"`
+	Key      []byte    `xorm:"notnull unique(blob) varbinary(255) "`
 	Size     int64     `xorm:"notnull"`
 	Modified time.Time `xorm:"notnull updated"`
 	Data     []byte    `xorm:"mediumblob"`
 }
 
 func (s *sqlStore) String() string {
-	return fmt.Sprintf("%s://%s/", s.db.DriverName(), s.addr)
+	driver := s.db.DriverName()
+	if driver == "pgx" {
+		driver = "postgres"
+	}
+	return fmt.Sprintf("%s://%s/", driver, s.addr)
 }
 
-func (s *sqlStore) Get(key string, off, limit int64) (io.ReadCloser, error) {
-	var b = blob{Key: key}
+func (s *sqlStore) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
+	var b = blob{Key: []byte(key)}
 	// TODO: range
 	ok, err := s.db.Get(&b)
 	if err != nil {
@@ -74,28 +75,28 @@ func (s *sqlStore) Get(key string, off, limit int64) (io.ReadCloser, error) {
 	if limit > 0 && limit < int64(len(data)) {
 		data = data[:limit]
 	}
-	return ioutil.NopCloser(bytes.NewBuffer(data)), nil
+	return io.NopCloser(bytes.NewBuffer(data)), nil
 }
 
-func (s *sqlStore) Put(key string, in io.Reader) error {
-	d, err := ioutil.ReadAll(in)
+func (s *sqlStore) Put(key string, in io.Reader, getters ...AttrGetter) error {
+	d, err := io.ReadAll(in)
 	if err != nil {
 		return err
 	}
 	var n int64
 	now := time.Now()
-	b := blob{Key: key, Data: d, Size: int64(len(d)), Modified: now}
-	if s.db.DriverName() == "postgres" {
+	b := blob{Key: []byte(key), Data: d, Size: int64(len(d)), Modified: now}
+	if name := s.db.DriverName(); name == "postgres" || name == "pgx" {
 		var r sql.Result
 		r, err = s.db.Exec("INSERT INTO jfs_blob(key, size,modified, data) VALUES(?, ?, ?,? ) "+
-			"ON CONFLICT (key) DO UPDATE SET size=?,data=?", key, b.Size, now, d, b.Size, d)
+			"ON CONFLICT (key) DO UPDATE SET size=?,data=?", []byte(key), b.Size, now, d, b.Size, d)
 		if err == nil {
 			n, err = r.RowsAffected()
 		}
 	} else {
 		n, err = s.db.Insert(&b)
 		if err != nil || n == 0 {
-			n, err = s.db.Update(&b, &blob{Key: key})
+			n, err = s.db.Update(&b, &blob{Key: []byte(key)})
 		}
 	}
 	if err == nil && n == 0 {
@@ -105,7 +106,7 @@ func (s *sqlStore) Put(key string, in io.Reader) error {
 }
 
 func (s *sqlStore) Head(key string) (Object, error) {
-	var b = blob{Key: key}
+	var b = blob{Key: []byte(key)}
 	ok, err := s.db.Cols("key", "modified", "size").Get(&b)
 	if err != nil {
 		return nil, err
@@ -118,37 +119,42 @@ func (s *sqlStore) Head(key string) (Object, error) {
 		b.Size,
 		b.Modified,
 		strings.HasSuffix(key, "/"),
+		"",
 	}, nil
 }
 
-func (s *sqlStore) Delete(key string) error {
-	_, err := s.db.Delete(&blob{Key: key})
+func (s *sqlStore) Delete(key string, getters ...AttrGetter) error {
+	_, err := s.db.Delete(&blob{Key: []byte(key)})
 	return err
 }
 
-func (s *sqlStore) List(prefix, marker string, limit int64) ([]Object, error) {
+func (s *sqlStore) List(prefix, marker, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
 	if marker == "" {
 		marker = prefix
 	}
+	// todo
+	if delimiter != "" {
+		return nil, false, "", notSupported
+	}
 	var bs []blob
-	err := s.db.Where("`key` >= ?", marker).Limit(int(limit)).Cols("`key`", "size", "modified").OrderBy("`key`").Find(&bs)
+	err := s.db.Where("`key` > ?", []byte(marker)).Limit(int(limit)).Cols("`key`", "size", "modified").OrderBy("`key`").Find(&bs)
 	if err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
 	var objs []Object
 	for _, b := range bs {
-		if strings.HasPrefix(b.Key, prefix) {
+		if strings.HasPrefix(string(b.Key), prefix) {
 			objs = append(objs, &obj{
-				key:   b.Key,
+				key:   string(b.Key),
 				size:  b.Size,
 				mtime: b.Modified,
-				isDir: strings.HasSuffix(b.Key, "/"),
+				isDir: strings.HasSuffix(string(b.Key), "/"),
 			})
 		} else {
 			break
 		}
 	}
-	return objs, nil
+	return generateListResult(objs, limit)
 }
 
 func newSQLStore(driver, addr, user, password string) (ObjectStorage, error) {
@@ -157,8 +163,21 @@ func newSQLStore(driver, addr, user, password string) (ObjectStorage, error) {
 	if user != "" {
 		uri = user + ":" + password + "@" + addr
 	}
+	var searchPath string
 	if driver == "postgres" {
 		uri = "postgres://" + uri
+		driver = "pgx"
+
+		parse, err := url.Parse(uri)
+		if err != nil {
+			return nil, fmt.Errorf("parse url %s failed: %s", uri, err)
+		}
+		searchPath = parse.Query().Get("search_path")
+		if searchPath != "" {
+			if len(strings.Split(searchPath, ",")) > 1 {
+				return nil, fmt.Errorf("currently, only one schema is supported in search_path")
+			}
+		}
 	}
 	engine, err := xorm.NewEngine(driver, uri)
 	if err != nil {
@@ -176,6 +195,9 @@ func newSQLStore(driver, addr, user, password string) (ObjectStorage, error) {
 	default:
 		engine.SetLogLevel(log.LOG_OFF)
 	}
+	if searchPath != "" {
+		engine.SetSchema(searchPath)
+	}
 	engine.SetTableMapper(names.NewPrefixMapper(engine.GetTableMapper(), "jfs_"))
 	if err := engine.Sync2(new(blob)); err != nil {
 		return nil, fmt.Errorf("create table blob: %s", err)
@@ -183,22 +205,10 @@ func newSQLStore(driver, addr, user, password string) (ObjectStorage, error) {
 	return &sqlStore{DefaultObjectStorage{}, engine, addr}, nil
 }
 
-func init() {
-	Register("sqlite3", func(addr, user, pass, token string) (ObjectStorage, error) {
-		p := strings.Index(addr, "://")
-		if p > 0 {
-			addr = addr[p+3:]
-		}
-		return newSQLStore("sqlite3", addr, user, pass)
-	})
-	Register("mysql", func(addr, user, pass, token string) (ObjectStorage, error) {
-		p := strings.Index(addr, "://")
-		if p > 0 {
-			addr = addr[p+3:]
-		}
-		return newSQLStore("mysql", addr, user, pass)
-	})
-	Register("postgres", func(addr, user, pass, token string) (ObjectStorage, error) {
-		return newSQLStore("postgres", addr, user, pass)
-	})
+func removeScheme(addr string) string {
+	p := strings.Index(addr, "://")
+	if p > 0 {
+		addr = addr[p+3:]
+	}
+	return addr
 }

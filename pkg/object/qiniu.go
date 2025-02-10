@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -46,6 +47,14 @@ type qiniu struct {
 
 func (q *qiniu) String() string {
 	return fmt.Sprintf("qiniu://%s/", q.bucket)
+}
+
+func (q *qiniu) SetStorageClass(_ string) error {
+	return notSupported
+}
+
+func (q *qiniu) Limits() Limits {
+	return Limits{}
 }
 
 func (q *qiniu) download(key string, off, limit int64) (io.ReadCloser, error) {
@@ -91,10 +100,11 @@ func (q *qiniu) Head(key string) (Object, error) {
 		r.Fsize,
 		mtime,
 		strings.HasSuffix(key, "/"),
+		"",
 	}, nil
 }
 
-func (q *qiniu) Get(key string, off, limit int64) (io.ReadCloser, error) {
+func (q *qiniu) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
 	// S3 SDK cannot get objects with prefix "/" in the key
 	if strings.HasPrefix(key, "/") && os.Getenv("QINIU_DOMAIN") != "" {
 		return q.download(key, off, limit)
@@ -103,10 +113,10 @@ func (q *qiniu) Get(key string, off, limit int64) (io.ReadCloser, error) {
 		key = key[1:]
 	}
 	// S3ForcePathStyle = true
-	return q.s3client.Get("/"+key, off, limit)
+	return q.s3client.Get("/"+key, off, limit, getters...)
 }
 
-func (q *qiniu) Put(key string, in io.Reader) error {
+func (q *qiniu) Put(key string, in io.Reader, getters ...AttrGetter) error {
 	body, vlen, err := findLen(in)
 	if err != nil {
 		return err
@@ -126,7 +136,7 @@ func (q *qiniu) CreateMultipartUpload(key string) (*MultipartUpload, error) {
 	return nil, notSupported
 }
 
-func (q *qiniu) Delete(key string) error {
+func (q *qiniu) Delete(key string, getters ...AttrGetter) error {
 	err := q.bm.Delete(q.bucket, key)
 	if err != nil && strings.Contains(err.Error(), notexist) {
 		return nil
@@ -134,36 +144,42 @@ func (q *qiniu) Delete(key string) error {
 	return err
 }
 
-func (q *qiniu) List(prefix, marker string, limit int64) ([]Object, error) {
+func (q *qiniu) List(prefix, startAfter, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
 	if limit > 1000 {
 		limit = 1000
 	}
-	if marker == "" {
-		q.marker = ""
-	} else if q.marker == "" {
-		// last page
-		return nil, nil
-	}
-	entries, _, markerOut, hasNext, err := q.bm.ListFiles(q.bucket, prefix, "", q.marker, int(limit))
-	for err == nil && len(entries) == 0 && hasNext {
-		entries, _, markerOut, hasNext, err = q.bm.ListFiles(q.bucket, prefix, "", markerOut, int(limit))
-	}
-	q.marker = markerOut
+	entries, prefixes, markerOut, hasNext, err := q.bm.ListFiles(q.bucket, prefix, delimiter, token, int(limit))
 	if len(entries) > 0 || err == io.EOF {
 		// ignore error if returned something
 		err = nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
 	n := len(entries)
-	objs := make([]Object, n)
+	objs := make([]Object, 0, n)
 	for i := 0; i < n; i++ {
 		entry := entries[i]
+		if entry.Key <= startAfter {
+			continue
+		}
 		mtime := entry.PutTime / 10000000
-		objs[i] = &obj{entry.Key, entry.Fsize, time.Unix(mtime, 0), strings.HasSuffix(entry.Key, "/")}
+		objs = append(objs, &obj{entry.Key, entry.Fsize, time.Unix(mtime, 0), strings.HasSuffix(entry.Key, "/"), ""})
 	}
-	return objs, nil
+	if delimiter != "" {
+		for _, p := range prefixes {
+			if p <= startAfter {
+				continue
+			}
+			objs = append(objs, &obj{p, 0, time.Unix(0, 0), true, ""})
+		}
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
+	}
+	if len(objs) == 0 {
+		hasNext = false
+		markerOut = ""
+	}
+	return objs, hasNext, markerOut, nil
 }
 
 func newQiniu(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {
@@ -201,7 +217,7 @@ func newQiniu(endpoint, accessKey, secretKey, token string) (ObjectStorage, erro
 		return nil, fmt.Errorf("aws session: %s", err)
 	}
 	ses.Handlers.Build.PushFront(disableSha256Func)
-	s3client := s3client{bucket, s3.New(ses), ses}
+	s3client := s3client{bucket: bucket, s3: s3.New(ses), ses: ses}
 
 	cfg := storage.Config{
 		UseHTTPS: uri.Scheme == "https",

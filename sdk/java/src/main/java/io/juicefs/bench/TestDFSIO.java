@@ -311,9 +311,9 @@ public class TestDFSIO extends Main.Command {
             "      Number of threads: " + threadsPerMap,
             "Number files per thread: " + filesPerThread,
             "            Total files: " + threadsPerMap * filesPerThread,
-            " Total MBytes processed: " + df.format(TestDFSIO.toMB(sizeProcessed.get())),
-            "Total Throughput mb/sec: " + df.format(TestDFSIO.toMB(sizeProcessed.get()) / TestDFSIO.msToSecs(end - start)),
-            "     Test exec time sec: " + df.format(TestDFSIO.msToSecs(end - start)),
+            " Total MBytes processed: " + df.format(toMB(sizeProcessed.get())),
+            "Total Throughput MB/sec: " + df.format(toMB(sizeProcessed.get()) / msToSecs(end - start)),
+            "     Test exec time sec: " + df.format(msToSecs(end - start)),
             ""};
 
     for (String resultLine : resultLines) {
@@ -584,6 +584,7 @@ public class TestDFSIO extends Main.Command {
           Class<? extends Mapper<Text, LongWritable, Text, Text>> mapperClass,
           Path outputDir) throws IOException {
     JobConf job = new JobConf(config, TestDFSIO.class);
+    job.setBoolean("mapreduce.output.fileoutputformat.compress", false);
 
     FileInputFormat.setInputPaths(job, getControlDir(config));
     job.setInputFormat(SequenceFileInputFormat.class);

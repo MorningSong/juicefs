@@ -22,6 +22,9 @@ import (
 	"time"
 )
 
+//mutate_test_job_number: 2
+//checksum 9cb13bb28aa7918edaf4f0f4ca92eea5
+//checksum 05debda2840d31bac0ab5c20c5510591
 func TestMin(t *testing.T) {
 	assertEqual(t, Min(1, 2), 1)
 	assertEqual(t, Min(-1, -2), -2)
@@ -79,6 +82,38 @@ func TestTimeout(t *testing.T) {
 		return nil
 	}, time.Millisecond*10)
 	if err == nil || !strings.HasPrefix(err.Error(), "timeout after") {
-		t.Fatalf("slow function should be timeout: %s", err)
+		t.Fatalf("slow function should  be timeout: %s", err)
+	}
+}
+
+func TestRemovePassword(t *testing.T) {
+	testCase := []struct {
+		uri      string
+		expected string
+	}{
+		{"redis://:password@localhost:6379/0",
+			"redis://:****@localhost:6379/0",
+		},
+		{"redis://:pass@word@localhost:6379/0",
+			"redis://:****@localhost:6379/0",
+		},
+		{":password@localhost:6379/0",
+			":****@localhost:6379/0",
+		},
+		{"oss://ak:sk@zhijian-test2.oss-cn-hangzhou.aliyuncs.com",
+			"oss://ak:****@zhijian-test2.oss-cn-hangzhou.aliyuncs.com",
+		},
+		{"/tmp/file",
+			"/tmp/file",
+		},
+		{"file:///tmp/file",
+			"file:///tmp/file",
+		},
+		{"sftp:///tmp/file",
+			"sftp:///tmp/file",
+		},
+	}
+	for _, tc := range testCase {
+		assertEqual(t, RemovePassword(tc.uri), tc.expected)
 	}
 }

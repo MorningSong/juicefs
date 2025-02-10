@@ -20,9 +20,30 @@
 package meta
 
 import (
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
+func isMySQLDuplicateEntryErr(err error) bool {
+	if e, ok := err.(*mysql.MySQLError); ok {
+		return e.Number == 1062
+	}
+	return false
+}
+
+func setMySQLTransactionIsolation(dns string) (string, error) {
+	cfg, err := mysql.ParseDSN(dns)
+	if err != nil {
+		return "", err
+	}
+	if cfg.Params == nil {
+		cfg.Params = make(map[string]string)
+	}
+	cfg.Params["transaction_isolation"] = "'repeatable-read'"
+	return cfg.FormatDSN(), nil
+}
+
 func init() {
+	dupErrorCheckers = append(dupErrorCheckers, isMySQLDuplicateEntryErr)
+	setTransactionIsolation = setMySQLTransactionIsolation
 	Register("mysql", newSQLMeta)
 }

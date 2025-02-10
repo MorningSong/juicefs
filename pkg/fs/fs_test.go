@@ -30,6 +30,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/vfs"
 )
 
+// mutate_test_job_number: 5
 func TestFileStat(t *testing.T) {
 	attr := meta.Attr{
 		Typ:   meta.TypeDirectory,
@@ -76,7 +77,7 @@ func TestFileSystem(t *testing.T) {
 	if e := fs.Access(ctx, "/", 7); e != 0 {
 		t.Fatalf("access /: %s", e)
 	}
-	f, err := fs.Create(ctx, "/hello", 0644)
+	f, err := fs.Create(ctx, "/hello", 0666, 022)
 	if err != 0 {
 		t.Fatalf("create /hello: %s", err)
 	}
@@ -84,7 +85,7 @@ func TestFileSystem(t *testing.T) {
 		t.Fatalf("name: %s", f.Name())
 	}
 	_ = f.Close(ctx)
-	f, err = fs.Open(ctx, "/hello", mMaskR|mMaskW)
+	f, err = fs.Open(ctx, "/hello", meta.MODE_MASK_R|meta.MODE_MASK_W)
 	if err != 0 {
 		t.Fatalf("open %s", err)
 	}
@@ -169,18 +170,21 @@ func TestFileSystem(t *testing.T) {
 	if target, e := fs.Readlink(ctx, "/sym"); e != 0 || string(target) != "hello" {
 		t.Fatalf("readlink: %s", string(target))
 	}
-	if fi, err := fs.Stat(ctx, "/sym"); err != 0 || fi.name != "sym" {
+	if fi, err := fs.Stat(ctx, "/sym"); err != 0 || fi.name != "sym" || fi.IsSymlink() {
 		t.Fatalf("stat symlink: %s %+v", err, fi)
+	}
+	if fi, err := fs.Lstat(ctx, "/sym"); err != 0 || fi.name != "sym" || !fi.IsSymlink() {
+		t.Fatalf("lstat symlink: %s %+v", err, fi)
 	}
 	if err := fs.Delete(ctx, "/sym"); err != 0 {
 		t.Fatalf("delete /sym: %s", err)
 	}
 
-	if _, e := fs.Open(meta.NewContext(2, 2, []uint32{3}), "/hello", mMaskW); e == 0 || e != syscall.EACCES {
+	if _, e := fs.Open(meta.NewContext(2, 2, []uint32{3}), "/hello", meta.MODE_MASK_W); e == 0 || e != syscall.EACCES {
 		t.Fatalf("open without permission: %s", e)
 	}
 
-	if err := fs.Mkdir(ctx, "/d", 0755); err != 0 {
+	if err := fs.Mkdir(ctx, "/d", 0777, 022); err != 0 {
 		t.Fatalf("mkdir /d: %s", err)
 	}
 	d, e := fs.Open(ctx, "/", 0)
@@ -214,7 +218,7 @@ func TestFileSystem(t *testing.T) {
 		t.Fatalf("follow symlink: %s %+v", e, fi)
 	}
 
-	if s, e := d.Summary(ctx); e != 0 || s.Dirs != 2 || s.Files != 2 || s.Length != 8 || s.Size != 16<<10 {
+	if s, e := d.Summary(ctx); e != 0 || s.Dirs != 2 || s.Files != 2 || s.Length != 7 || s.Size != 16<<10 {
 		t.Fatalf("summary: %s %+v", e, s)
 	}
 	if e := fs.Delete(ctx, "/d"); e == 0 || !IsNotEmpty(e) {
@@ -226,7 +230,7 @@ func TestFileSystem(t *testing.T) {
 	if err := fs.Delete(ctx, "/d/f"); err == 0 || !IsNotExist(err) {
 		t.Fatalf("delete /d/f: %s", err)
 	}
-	if e := fs.Rmr(ctx, "/d"); e != 0 {
+	if e := fs.Rmr(ctx, "/d", meta.RmrDefaultThreads); e != 0 {
 		t.Fatalf("delete /d -r: %s", e)
 	}
 
@@ -242,13 +246,13 @@ func TestFileSystem(t *testing.T) {
 	}
 
 	// path with trailing /
-	if err := fs.Mkdir(ctx, "/ddd/", 0777); err != 0 {
+	if err := fs.Mkdir(ctx, "/ddd/", 0777, 000); err != 0 {
 		t.Fatalf("mkdir /ddd/: %s", err)
 	}
-	if _, err := fs.Create(ctx, "/ddd/ddd", 0777); err != 0 {
+	if _, err := fs.Create(ctx, "/ddd/ddd", 0777, 000); err != 0 {
 		t.Fatalf("create /ddd/ddd: %s", err)
 	}
-	if _, err := fs.Create(ctx, "/ddd/fff/", 0777); err != syscall.EINVAL {
+	if _, err := fs.Create(ctx, "/ddd/fff/", 0777, 000); err != syscall.EINVAL {
 		t.Fatalf("create /ddd/fff/: %s", err)
 	}
 	if err := fs.Delete(ctx, "/ddd/"); err != syscall.ENOTEMPTY {
@@ -257,7 +261,7 @@ func TestFileSystem(t *testing.T) {
 	if err := fs.Rename(ctx, "/ddd/", "/ttt/", 0); err != 0 {
 		t.Fatalf("delete /ddd/: %s", err)
 	}
-	if err := fs.Rmr(ctx, "/ttt/"); err != 0 {
+	if err := fs.Rmr(ctx, "/ttt/", meta.RmrDefaultThreads); err != 0 {
 		t.Fatalf("rmr /ttt/: %s", err)
 	}
 	if _, err := fs.Stat(ctx, "/ttt/"); err != syscall.ENOENT {
@@ -266,21 +270,19 @@ func TestFileSystem(t *testing.T) {
 }
 
 func createTestFS(t *testing.T) *FileSystem {
-	checkAccessFile = time.Millisecond
-	rotateAccessLog = 500
-	m := meta.NewClient("memkv://", &meta.Config{})
-	format := meta.Format{
+	m := meta.NewClient("memkv://", nil)
+	format := &meta.Format{
 		Name:      "test",
 		BlockSize: 4096,
 		Capacity:  1 << 30,
+		DirStats:  true,
 	}
 	_ = m.Init(format, true)
 	var conf = vfs.Config{
-		Meta: &meta.Config{},
+		Meta: meta.DefaultConf(),
 		Chunk: &chunk.Config{
 			BlockSize:  format.BlockSize << 10,
 			MaxUpload:  1,
-			MaxDeletes: 1,
 			BufferSize: 100 << 20,
 		},
 		DirEntryTimeout: time.Millisecond * 100,
@@ -291,8 +293,10 @@ func createTestFS(t *testing.T) *FileSystem {
 	objStore, _ := object.CreateStorage("mem", "", "", "", "")
 	store := chunk.NewCachedStore(objStore, *conf.Chunk, nil)
 	jfs, err := NewFileSystem(&conf, m, store)
+	jfs.checkAccessFile = time.Millisecond
+	jfs.rotateAccessLog = 500
 	if err != nil {
-		t.Fatalf("initialize failed: %s", err)
+		t.Fatalf("initialize  failed: %s", err)
 	}
 	return jfs
 }

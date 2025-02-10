@@ -1,0 +1,184 @@
+name: "fsrand"
+
+on:
+  push:
+    branches:
+    - main
+    - release**
+    paths:
+    - '**/fsrand.yml'
+    - '**/fs.py'
+    - '**/fs_test.py'
+    - '**/fs_acl_test.py'
+  pull_request:
+    branches:
+    - main
+    - release**
+    paths:
+    - '**/fsrand.yml'
+    - '**/fs.py'
+    - '**/fs_test.py'
+    - '**/fs_acl_test.py'
+  schedule:
+    - cron:  '0 17 * * 0'
+  workflow_dispatch:
+    inputs:
+      debug:
+        type: boolean
+        description: "Run the build with tmate debugging enabled"
+        required: false
+        default: false
+jobs:
+  fsrand:
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        meta: ['redis', 'mysql', 'tikv']
+        # meta: ['redis']
+        
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+
+      - name: mount coverage dir
+        timeout-minutes: 5
+        uses: ./.github/actions/mount-coverage-dir
+        with:
+          mount_point: cover
+          access_key: ${{ secrets.CI_COVERAGE_AWS_AK }}
+          secret_key: ${{ secrets.CI_COVERAGE_AWS_SK }}
+          token: ${{ secrets.CI_COVERAGE_AWS_TOKEN }}
+
+      - name: Set Variable
+        id: vars
+        run: |
+          if [ "${{matrix.meta}}" == "fdb" ]; then
+            echo "target=juicefs.fdb" >> $GITHUB_OUTPUT
+          else
+            echo "target=juicefs" >> $GITHUB_OUTPUT
+          fi
+  
+      - name: Build
+        timeout-minutes: 10
+        uses: ./.github/actions/build
+        with: 
+          target: ${{steps.vars.outputs.target}}
+
+      - name: Prepare meta db
+        run: | 
+          chmod +x .github/scripts/start_meta_engine.sh
+          source .github/scripts/start_meta_engine.sh
+          start_meta_engine ${{matrix.meta}}
+          meta_url=$(get_meta_url ${{matrix.meta}})
+          create_database $meta_url
+
+      - name: Install tool
+        run: | 
+          sudo .github/scripts/apt_install.sh attr
+          sudo pip install xattr
+          sudo pip install minio
+
+      - name: Juicefs Format
+        run: |
+          source .github/scripts/start_meta_engine.sh
+          meta_url=$(get_meta_url ${{matrix.meta}})
+          GOCOVERDIR=$(pwd)/cover ./juicefs format $meta_url --enable-acl --trash-days 0 myjfs
+
+      - name: Juicefs Mount
+        run: |
+          source .github/scripts/start_meta_engine.sh
+          meta_url=$(get_meta_url ${{matrix.meta}})
+          sudo GOCOVERDIR=$(pwd)/cover ./juicefs mount -d $meta_url /tmp/jfs --no-usage-report --enable-xattr 
+          if [ ! -f /tmp/jfs/.accesslog ]; then
+            echo "<FATAL>: mount failed"
+            exit 1
+          fi
+          
+      - name: Run Examples
+        timeout-minutes: 10
+        run: |
+          sudo -E python3 .github/scripts/hypo/fs_test.py
+          sudo -E python3 .github/scripts/hypo/fs_acl_test.py
+
+      - name: Download example database
+        timeout-minutes: 5
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: hypothesis-example-db-${{ matrix.meta }}
+          path: .hypothesis/examples
+
+      - name: Test
+        continue-on-error: true
+        timeout-minutes: 120
+        run: |
+          sudo -E LOG_LEVEL=WARNING python3 .github/scripts/hypo/fs.py 2>&1 | tee fsrand.log
+      
+      - name: check fsrand.log
+        if: always()
+        run: | 
+          grep "AssertionError" fsrand.log && exit 1 || true
+
+      - name: Upload example database
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          include-hidden-files: true
+          name: hypothesis-example-db-${{ matrix.meta }}
+          path: .hypothesis/examples
+
+      - name: check fsrand.log
+        if: always()
+        run: | 
+          [[ -f fsrand.log ]] && tail -500 fsrand.log || true
+
+      - name: check juicefs.log
+        if: always()
+        run: | 
+          if [ -f ~/.juicefs/juicefs.log ]; then
+            tail -300 ~/.juicefs/juicefs.log
+            grep "<FATAL>:" ~/.juicefs/juicefs.log && exit 1 || true
+          fi
+          if [ -f /var/log/juicefs.log ]; then
+            tail -300 /var/log/juicefs.log
+            grep "<FATAL>:" /var/log/juicefs.log && exit 1 || true
+          fi
+
+      - name: upload coverage report
+        timeout-minutes: 5
+        uses: ./.github/actions/upload-coverage
+        with:
+          UPLOAD_TOKEN: ${{ secrets.CI_COVERAGE_FILE_UPLOAD_AUTH_TOKEN }}
+
+      - name: Setup upterm session
+        if: failure() && (github.event.inputs.debug == 'true' || github.run_attempt != 1)
+        # if: failure() 
+        timeout-minutes: 60
+        uses: lhotari/action-upterm@v1
+
+  success-all-test:
+    runs-on: ubuntu-latest
+    needs: [fsrand]
+    if: always()
+    steps:
+      - uses: technote-space/workflow-conclusion-action@v3
+      - uses: actions/checkout@v3
+
+      - name: Check Failure
+        if: env.WORKFLOW_CONCLUSION == 'failure'
+        run: exit 1
+
+      - name: Send Slack Notification
+        if: failure() && github.event_name != 'workflow_dispatch'
+        uses: juicedata/slack-notify-action@main
+        with:
+          channel-id: "${{ secrets.SLACK_CHANNEL_ID_FOR_PR_CHECK_NOTIFY }}"
+          slack_bot_token: "${{ secrets.SLACK_BOT_TOKEN }}"
+
+      - name: Success
+        if: success()
+        run: echo "All Done"

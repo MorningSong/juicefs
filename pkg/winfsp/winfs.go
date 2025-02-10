@@ -68,7 +68,7 @@ func (j *juice) Init() {
 
 func (j *juice) newContext() vfs.LogContext {
 	if j.asRoot {
-		return vfs.NewLogContext(meta.Background)
+		return vfs.NewLogContext(meta.Background())
 	}
 	uid, gid, pid := fuse.Getcontext()
 	if uid == 0xffffffff {
@@ -89,7 +89,7 @@ func (j *juice) Statfs(path string, stat *fuse.Statfs_t) int {
 	ctx := j.newContext()
 	// defer trace(path)(stat)
 	var totalspace, availspace, iused, iavail uint64
-	j.fs.Meta().StatFS(ctx, &totalspace, &availspace, &iused, &iavail)
+	j.fs.Meta().StatFS(ctx, meta.RootInode, &totalspace, &availspace, &iused, &iavail)
 	var bsize uint64 = 4096
 	blocks := totalspace / bsize
 	bavail := availspace / bsize
@@ -106,6 +106,34 @@ func (j *juice) Statfs(path string, stat *fuse.Statfs_t) int {
 }
 
 func errorconv(err syscall.Errno) int {
+	// convert based on the error.i file in winfsp project
+	switch err {
+	case syscall.EACCES:
+		return -fuse.EACCES
+	case syscall.EEXIST:
+		return -fuse.EEXIST
+	case syscall.ENOENT, syscall.ENOTDIR:
+		return -fuse.ENOENT
+	case syscall.ECANCELED:
+		return -fuse.EINTR
+	case syscall.EIO:
+		return -fuse.EIO
+	case syscall.EINVAL:
+		return -fuse.ENXIO
+	case syscall.EBADFD:
+		return -fuse.EBADF
+	case syscall.EDQUOT:
+		return -fuse.ENOSPC
+	case syscall.EBUSY:
+		return -fuse.EBUSY
+	case syscall.ENOTEMPTY:
+		return -fuse.ENOTEMPTY
+	case syscall.ENAMETOOLONG:
+		return -fuse.ENAMETOOLONG
+	case syscall.ERROR_HANDLE_EOF:
+		return -fuse.ENODATA
+	}
+
 	return -int(err)
 }
 
@@ -132,7 +160,7 @@ func (j *juice) Mkdir(path string, mode uint32) (e int) {
 	}
 	ctx := j.newContext()
 	defer trace(path, mode)(&e)
-	e = errorconv(j.fs.Mkdir(ctx, path, uint16(mode)))
+	e = errorconv(j.fs.Mkdir(ctx, path, uint16(mode), 0))
 	return
 }
 
@@ -174,7 +202,7 @@ func (j *juice) Readlink(path string) (e int, target string) {
 		return
 	}
 	t, errno := j.vfs.Readlink(ctx, fi.Inode())
-	e = -int(errno)
+	e = errorconv(errno)
 	target = string(t)
 	return
 }
@@ -253,7 +281,7 @@ func (j *juice) Create(p string, flags int, mode uint32) (e int, fh uint64) {
 		j.handlers[fh] = entry.Inode
 		j.Unlock()
 	}
-	e = -int(errno)
+	e = errorconv(errno)
 	return
 }
 
@@ -272,24 +300,35 @@ func (j *juice) Open(path string, flags int) (e int, fh uint64) {
 func (j *juice) OpenEx(path string, fi *fuse.FileInfo_t) (e int) {
 	ctx := j.newContext()
 	defer trace(path, fi.Flags)(&e)
-	f, err := j.fs.Open(ctx, path, 0)
-	if err != 0 {
-		e = -fuse.ENOENT
-		return
+	ino := meta.Ino(0)
+	if strings.HasSuffix(path, "/.control") {
+		ino, _ = vfs.GetInternalNodeByName(".control")
+		if ino == 0 {
+			e = -fuse.ENOENT
+			return
+		}
+	} else {
+		f, err := j.fs.Open(ctx, path, 0)
+		if err != 0 {
+			e = -fuse.ENOENT
+			return
+		}
+		ino = f.Inode()
 	}
-	entry, fh, errno := j.vfs.Open(ctx, f.Inode(), uint32(fi.Flags))
+
+	entry, fh, errno := j.vfs.Open(ctx, ino, uint32(fi.Flags))
 	if errno == 0 {
 		fi.Fh = fh
-		if vfs.IsSpecialNode(f.Inode()) {
+		if vfs.IsSpecialNode(ino) {
 			fi.DirectIo = true
 		} else {
 			fi.KeepCache = entry.Attr.KeepCache
 		}
 		j.Lock()
-		j.handlers[fh] = f.Inode()
+		j.handlers[fh] = ino
 		j.Unlock()
 	}
-	e = -int(errno)
+	e = errorconv(errno)
 	return
 }
 
@@ -363,13 +402,42 @@ func (j *juice) reopen(p string, fh *uint64) meta.Ino {
 }
 
 // Getattr gets file attributes.
+func (j *juice) getAttrForControlFile(ctx vfs.LogContext, p string, stat *fuse.Stat_t, fh uint64) (e int) {
+	parentDir := path.Dir(p)
+	_, err := j.fs.Stat(ctx, parentDir)
+	if err != 0 {
+		e = -fuse.ENOENT
+		return
+	}
+
+	inode, attr := vfs.GetInternalNodeByName(".control")
+	if inode == 0 {
+		e = -fuse.ENOENT
+		return
+	}
+
+	j.vfs.UpdateLength(inode, attr)
+	attrToStat(inode, attr, stat)
+	return
+}
+
+// Getattr gets file attributes.
 func (j *juice) Getattr(p string, stat *fuse.Stat_t, fh uint64) (e int) {
 	ctx := j.newContext()
 	defer trace(p, fh)(stat, &e)
 	ino := j.h2i(&fh)
 	if ino == 0 {
+		// special case for .control file
+		if strings.HasSuffix(p, "/.control") {
+			j.getAttrForControlFile(ctx, p, stat, fh)
+			return
+		}
+
 		fi, err := j.fs.Stat(ctx, p)
 		if err != 0 {
+			// Known issue: If the parent directory is not exists, the Windows api such as
+			// GetFileAttributeX expects the ERROR_PATH_NOT_FOUND returned.
+			// However, the fuse api has no such error code defined.
 			e = -fuse.ENOENT
 			return
 		}
@@ -394,7 +462,7 @@ func (j *juice) Truncate(path string, size int64, fh uint64) (e int) {
 		e = -fuse.EBADF
 		return
 	}
-	e = -int(j.vfs.Truncate(ctx, ino, size, 1, nil))
+	e = -int(j.vfs.Truncate(ctx, ino, size, 0, nil))
 	return
 }
 
@@ -413,7 +481,7 @@ func (j *juice) Read(path string, buf []byte, off int64, fh uint64) (e int) {
 	}
 	n, err := j.vfs.Read(ctx, ino, buf, uint64(off), fh)
 	if err != 0 {
-		e = -int(err)
+		e = errorconv(err)
 		return
 	}
 	return n
@@ -434,7 +502,7 @@ func (j *juice) Write(path string, buff []byte, off int64, fh uint64) (e int) {
 	}
 	errno := j.vfs.Write(ctx, ino, buff, uint64(off), fh)
 	if errno != 0 {
-		e = -int(errno)
+		e = errorconv(errno)
 	} else {
 		e = len(buff)
 	}
@@ -450,7 +518,7 @@ func (j *juice) Flush(path string, fh uint64) (e int) {
 		e = -fuse.EBADF
 		return
 	}
-	e = -int(j.vfs.Flush(ctx, ino, fh, 0))
+	e = errorconv(j.vfs.Flush(ctx, ino, fh, 0))
 	return
 }
 
@@ -484,7 +552,7 @@ func (j *juice) Fsync(path string, datasync bool, fh uint64) (e int) {
 	if ino == 0 {
 		e = -fuse.EBADF
 	} else {
-		e = -int(j.vfs.Fsync(ctx, ino, 1, fh))
+		e = errorconv(j.vfs.Fsync(ctx, ino, 1, fh))
 	}
 	return
 }
@@ -498,13 +566,13 @@ func (j *juice) Opendir(path string) (e int, fh uint64) {
 		e = -fuse.ENOENT
 		return
 	}
-	fh, errno := j.vfs.Opendir(ctx, f.Inode())
+	fh, errno := j.vfs.Opendir(ctx, f.Inode(), 0)
 	if errno == 0 {
 		j.Lock()
 		j.handlers[fh] = f.Inode()
 		j.Unlock()
 	}
-	e = -int(errno)
+	e = errorconv(errno)
 	return
 }
 
@@ -521,7 +589,7 @@ func (j *juice) Readdir(path string,
 	ctx := j.newContext()
 	entries, readAt, err := j.vfs.Readdir(ctx, ino, 100000, int(ofst), fh, true)
 	if err != 0 {
-		e = -int(err)
+		e = errorconv(err)
 		return
 	}
 	var st fuse.Stat_t
@@ -585,6 +653,7 @@ func Serve(v *vfs.VFS, fuseOpt string, fileCacheTo float64, asRoot bool, delayCl
 	host := fuse.NewFileSystemHost(&jfs)
 	jfs.host = host
 	var options = "volname=" + conf.Format.Name
+	// create_umask 022 results in 755 for directories and 644 for files, see https://github.com/winfsp/sshfs-win/issues/14
 	options += ",ExactFileSystemName=JuiceFS,create_umask=022,ThreadCount=16"
 	options += ",DirInfoTimeout=1000,VolumeInfoTimeout=1000,KeepFileCache"
 	options += fmt.Sprintf(",FileInfoTimeout=%d", int(fileCacheTo*1000))

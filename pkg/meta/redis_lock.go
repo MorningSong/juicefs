@@ -20,12 +20,13 @@
 package meta
 
 import (
+	"context"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 )
 
 func (r *redisMeta) Flock(ctx Context, inode Ino, owner uint64, ltype uint32, block bool) syscall.Errno {
@@ -54,6 +55,7 @@ func (r *redisMeta) Flock(ctx Context, inode Ino, owner uint64, ltype uint32, bl
 			if err != nil {
 				return err
 			}
+			delete(owners, lkey)
 			if ltype == F_RDLCK {
 				for _, v := range owners {
 					if v == "W" {
@@ -66,7 +68,6 @@ func (r *redisMeta) Flock(ctx Context, inode Ino, owner uint64, ltype uint32, bl
 				})
 				return err
 			}
-			delete(owners, lkey)
 			if len(owners) > 0 {
 				return syscall.EAGAIN
 			}
@@ -110,13 +111,13 @@ func (r *redisMeta) Getlk(ctx Context, inode Ino, owner uint64, ltype *uint32, s
 		ls := loadLocks([]byte(d))
 		for _, l := range ls {
 			// find conflicted locks
-			if (*ltype == F_WRLCK || l.ltype == F_WRLCK) && *end >= l.start && *start <= l.end {
-				*ltype = l.ltype
-				*start = l.start
-				*end = l.end
+			if (*ltype == F_WRLCK || l.Type == F_WRLCK) && *end >= l.Start && *start <= l.End {
+				*ltype = l.Type
+				*start = l.Start
+				*end = l.End
 				sid, _ := strconv.Atoi(strings.Split(k, "_")[0])
 				if uint64(sid) == r.sid {
-					*pid = l.pid
+					*pid = l.Pid
 				} else {
 					*pid = 0
 				}
@@ -178,7 +179,7 @@ func (r *redisMeta) Setlk(ctx Context, inode Ino, owner uint64, block bool, ltyp
 				ls := loadLocks([]byte(d))
 				for _, l := range ls {
 					// find conflicted locks
-					if (ltype == F_WRLCK || l.ltype == F_WRLCK) && end >= l.start && start <= l.end {
+					if (ltype == F_WRLCK || l.Type == F_WRLCK) && end >= l.Start && start <= l.End {
 						return syscall.EAGAIN
 					}
 				}
@@ -205,4 +206,39 @@ func (r *redisMeta) Setlk(ctx Context, inode Ino, owner uint64, block bool, ltyp
 		}
 	}
 	return errno(err)
+}
+
+func (r *redisMeta) ListLocks(ctx context.Context, inode Ino) ([]PLockItem, []FLockItem, error) {
+	fKey := r.flockKey(inode)
+	pKey := r.plockKey(inode)
+
+	rawFLocks, err := r.rdb.HGetAll(ctx, fKey).Result()
+	if err != nil {
+		return nil, nil, err
+	}
+	flocks := make([]FLockItem, 0, len(rawFLocks))
+	for k, v := range rawFLocks {
+		owner, err := parseOwnerKey(k)
+		if err != nil {
+			return nil, nil, err
+		}
+		flocks = append(flocks, FLockItem{*owner, v})
+	}
+
+	rawPLocks, err := r.rdb.HGetAll(ctx, pKey).Result()
+	if err != nil {
+		return nil, nil, err
+	}
+	plocks := make([]PLockItem, 0)
+	for k, d := range rawPLocks {
+		owner, err := parseOwnerKey(k)
+		if err != nil {
+			return nil, nil, err
+		}
+		ls := loadLocks([]byte(d))
+		for _, l := range ls {
+			plocks = append(plocks, PLockItem{*owner, l})
+		}
+	}
+	return plocks, flocks, nil
 }

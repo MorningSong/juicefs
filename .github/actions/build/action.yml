@@ -1,0 +1,55 @@
+name: 'Build Action'
+description: 'Build action'
+inputs:
+  target:
+    description: 'build target: juicefs, juicefs.fdb etc'
+    required: true
+    default: 'juicefs'
+  beta:
+    description: 'beta version for the following test'
+    required: false
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-go@v3
+      with:
+        go-version: 'oldstable'
+        cache: true
+
+    - name: Change go version for root user
+      shell: bash
+      run: |
+        go_path=`which go`
+        echo $go_path
+        root_go_path=`sudo which go`
+        echo $root_go_path
+        sudo rm -f $root_go_path
+        sudo ln -s $go_path $root_go_path
+        go version
+        sudo go version
+
+    - name: Install tools
+      shell: bash
+      run: |
+        if [ "${{inputs.target}}" == "juicefs.fdb" ]; then
+          wget -q https://github.com/apple/foundationdb/releases/download/6.3.23/foundationdb-clients_6.3.23-1_amd64.deb
+          sudo dpkg -i foundationdb-clients_6.3.23-1_amd64.deb
+        elif [ "${{inputs.target}}" == "juicefs.gluster" ]; then
+          sudo .github/scripts/apt_install.sh uuid-dev libglusterfs-dev
+        fi
+
+    - name: Build linux target
+      shell: bash
+      run: |
+        if [[ -n "${{ inputs.beta }}" ]]; then
+          echo "use beta version of juicefs: ${{inputs.beta}}"
+          wget -q https://juicefs-com-static.oss-cn-shanghai.aliyuncs.com/juicefs_beta/${{inputs.beta}} -O juicefs
+          chmod +x juicefs
+          ./juicefs version
+        else
+          echo "start to build ${{inputs.target}}"
+          make ${{inputs.target}}.cover
+          [ "${{inputs.target}}" != "juicefs" ] &&  mv ${{inputs.target}} juicefs
+          ./juicefs version
+          echo "build ${{inputs.target}} succeed"
+        fi

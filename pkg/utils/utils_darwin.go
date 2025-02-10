@@ -16,4 +16,31 @@
 
 package utils
 
+import (
+	"fmt"
+	"os/exec"
+)
+
 func GetKernelVersion() (major, minor int) { return }
+
+func GetSysInfo() string {
+	var (
+		kernel    string
+		osVersion []byte
+		hardware  []byte
+	)
+
+	kernel, _ = GetKernelInfo()
+
+	osVersion, _ = exec.Command("sw_vers").Output()
+
+	hardware, _ = exec.Command("system_profiler", "SPMemoryDataType", "SPStorageDataType").Output()
+
+	return fmt.Sprintf(`
+Kernel: 
+%s
+OS: 
+%s
+Hardware: 
+%s`, kernel, string(osVersion), string(hardware))
+}

@@ -22,7 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -30,28 +30,43 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/dustin/go-humanize"
+	"github.com/oliverisaac/shellescape"
+
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/juicedata/juicefs/pkg/utils"
 )
 
 // Stat has the counters to represent the progress.
 type Stat struct {
 	Copied       int64 // the number of copied files
 	CopiedBytes  int64 // total amount of copied data in bytes
+	Checked      int64 // the number of checked files
 	CheckedBytes int64 // total amount of checked data in bytes
 	Deleted      int64 // the number of deleted files
 	Skipped      int64 // the number of files skipped
+	SkippedBytes int64 // total amount of skipped data in bytes
 	Failed       int64 // the number of files that fail to copy
 }
 
 func updateStats(r *Stat) {
 	copied.IncrInt64(r.Copied)
 	copiedBytes.IncrInt64(r.CopiedBytes)
-	checkedBytes.IncrInt64(r.CheckedBytes)
-	deleted.IncrInt64(r.Deleted)
+	if checked != nil {
+		checked.IncrInt64(r.Checked)
+		checkedBytes.IncrInt64(r.CheckedBytes)
+	}
+	if deleted != nil {
+		deleted.IncrInt64(r.Deleted)
+	}
 	skipped.IncrInt64(r.Skipped)
-	failed.IncrInt64(r.Failed)
+	skippedBytes.IncrInt64(r.SkippedBytes)
+	if failed != nil {
+		failed.IncrInt64(r.Failed)
+	}
 	handled.IncrInt64(r.Copied + r.Deleted + r.Skipped + r.Failed)
 }
 
@@ -70,88 +85,75 @@ func httpRequest(url string, body []byte) (ans []byte, err error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	return ioutil.ReadAll(resp.Body)
+	return io.ReadAll(resp.Body)
 }
 
+var sendStatMu sync.Mutex
+
 func sendStats(addr string) {
+	sendStatMu.Lock()
+	defer sendStatMu.Unlock()
 	var r Stat
+	r.Skipped = skipped.Current()
+	r.SkippedBytes = skippedBytes.Current()
 	r.Copied = copied.Current()
 	r.CopiedBytes = copiedBytes.Current()
-	r.CheckedBytes = checkedBytes.Current()
-	r.Deleted = deleted.Current()
-	r.Skipped = skipped.Current()
-	r.Failed = failed.Current()
+	if checked != nil {
+		r.Checked = checked.Current()
+		r.CheckedBytes = checkedBytes.Current()
+	}
+	if deleted != nil {
+		r.Deleted = deleted.Current()
+	}
+	if failed != nil {
+		r.Failed = failed.Current()
+	}
 	d, _ := json.Marshal(r)
 	ans, err := httpRequest(fmt.Sprintf("http://%s/stats", addr), d)
 	if err != nil || string(ans) != "OK" {
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			logger.Errorf("the management process has been stopped, so the worker process now exits")
+			os.Exit(1)
+		}
 		logger.Errorf("update stats: %s %s", string(ans), err)
 	} else {
+		skipped.IncrInt64(-r.Skipped)
+		skippedBytes.IncrInt64(-r.SkippedBytes)
 		copied.IncrInt64(-r.Copied)
 		copiedBytes.IncrInt64(-r.CopiedBytes)
-		checkedBytes.IncrInt64(-r.CheckedBytes)
-		deleted.IncrInt64(-r.Deleted)
-		skipped.IncrInt64(-r.Skipped)
-		failed.IncrInt64(-r.Failed)
+		if checked != nil {
+			checked.IncrInt64(-r.Checked)
+			checkedBytes.IncrInt64(-r.CheckedBytes)
+		}
+		if deleted != nil {
+			deleted.IncrInt64(-r.Deleted)
+		}
+		if failed != nil {
+			failed.IncrInt64(-r.Failed)
+		}
 	}
 }
 
-func findLocalIP() (string, error) {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return "", err
-	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 {
-			continue // interface down
-		}
-		if iface.Flags&net.FlagLoopback != 0 {
-			continue // loopback interface
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			return "", err
-		}
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip == nil || ip.IsLoopback() {
-				continue
-			}
-			ip = ip.To4()
-			if ip == nil {
-				continue // not an ipv4 address
-			}
-			return ip.String(), nil
-		}
-	}
-	return "", errors.New("are you connected to the network?")
-}
-
-func startManager(tasks <-chan object.Object) (string, error) {
+func startManager(config *Config, tasks <-chan object.Object) (string, error) {
 	http.HandleFunc("/fetch", func(w http.ResponseWriter, req *http.Request) {
 		var objs []object.Object
+		var total int64
 		obj, ok := <-tasks
 		if !ok {
 			_, _ = w.Write([]byte("[]"))
 			return
 		}
 		objs = append(objs, obj)
+		total += obj.Size()
 	LOOP:
-		for {
+		for len(objs) < 100 && total < 400<<20 {
 			select {
 			case obj = <-tasks:
 				if obj == nil {
 					break LOOP
 				}
 				objs = append(objs, obj)
-				if len(objs) > 100 {
-					break LOOP
-				}
+				total += obj.Size()
 			default:
 				break LOOP
 			}
@@ -161,7 +163,7 @@ func startManager(tasks <-chan object.Object) (string, error) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		logger.Debugf("send %d objects to %s", len(objs), req.RemoteAddr)
+		logger.Debugf("send %d objects(%s) to %s", len(objs), humanize.IBytes(uint64(total)), req.RemoteAddr)
 		_, _ = w.Write(d)
 	})
 	http.HandleFunc("/stats", func(w http.ResponseWriter, req *http.Request) {
@@ -169,7 +171,7 @@ func startManager(tasks <-chan object.Object) (string, error) {
 			http.Error(w, "POST required", http.StatusBadRequest)
 			return
 		}
-		d, err := ioutil.ReadAll(req.Body)
+		d, err := io.ReadAll(req.Body)
 		if err != nil {
 			logger.Errorf("read: %s", err)
 			return
@@ -184,19 +186,28 @@ func startManager(tasks <-chan object.Object) (string, error) {
 		logger.Debugf("receive stats %+v from %s", r, req.RemoteAddr)
 		_, _ = w.Write([]byte("OK"))
 	})
-	ip, err := findLocalIP()
-	if err != nil {
-		return "", fmt.Errorf("find local ip: %s", err)
+	var addr string
+	if config.ManagerAddr != "" {
+		addr = config.ManagerAddr
+	} else {
+		ip, err := utils.GetLocalIp(net.JoinHostPort(config.Workers[0], "22"))
+		if err != nil {
+			return "", fmt.Errorf("not found local ip: %s", err)
+		}
+		addr = ip
 	}
-	l, err := net.Listen("tcp", ip+":")
+
+	if !strings.Contains(addr, ":") {
+		addr += ":"
+	}
+
+	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		return "", fmt.Errorf("listen: %s", err)
 	}
 	logger.Infof("Listen at %s", l.Addr())
 	go func() { _ = http.Serve(l, nil) }()
-	ps := strings.Split(l.Addr().String(), ":")
-	port := ps[len(ps)-1]
-	return fmt.Sprintf("%s:%s", ip, port), nil
+	return l.Addr().String(), nil
 }
 
 func findSelfPath() (string, error) {
@@ -233,31 +244,48 @@ func launchWorker(address string, config *Config, wg *sync.WaitGroup) {
 			}
 			rpath := filepath.Join("/tmp", filepath.Base(path))
 			cmd := exec.Command("rsync", "-au", path, host+":"+rpath)
-			err = cmd.Run()
+			output, err := cmd.CombinedOutput()
+			logger.Debugf("exec: %s,err: %s", cmd.String(), string(output))
 			if err != nil {
 				// fallback to scp
-				cmd = exec.Command("scp", path, host+":"+rpath)
-				err = cmd.Run()
+				cmd = exec.Command("scp", "-o", "StrictHostKeyChecking=no", path, host+":"+rpath)
+				output, err = cmd.CombinedOutput()
+				logger.Debugf("exec: %s,err: %s", cmd.String(), string(output))
 			}
 			if err != nil {
 				logger.Errorf("copy itself to %s: %s", host, err)
 				return
 			}
 			// launch itself
-			var args = []string{host, rpath}
-			if strings.HasSuffix(path, "juicefs") {
-				args = append(args, os.Args[1:]...)
-				args = append(args, "--manager", address)
-			} else {
-				args = append(args, "--manager", address)
-				args = append(args, os.Args[1:]...)
+			var args = []string{host}
+			// set env
+			var printEnv []string
+			for k, v := range config.Env {
+				args = append(args, fmt.Sprintf("%s=%s", k, v))
+				if strings.Contains(k, "SECRET") ||
+					strings.Contains(k, "TOKEN") ||
+					strings.Contains(k, "PASSWORD") ||
+					strings.Contains(k, "AZURE_STORAGE_CONNECTION_STRING") ||
+					strings.Contains(k, "JFS_RSA_PASSPHRASE") {
+					v = "******"
+				}
+				printEnv = append(printEnv, fmt.Sprintf("%s=%s", k, v))
 			}
+
+			args = append(args, rpath)
+			args = append(args, os.Args[1:]...)
+			args = append(args, "--manager", address)
 			if !config.Verbose && !config.Quiet {
 				args = append(args, "-q")
 			}
-
-			logger.Debugf("launch worker command args: [ssh, %s]", strings.Join(args, ", "))
-			cmd = exec.Command("ssh", args...)
+			var argsBk = make([]string, len(args))
+			copy(argsBk, args)
+			for i, s := range printEnv {
+				argsBk[i+1] = s
+			}
+			logger.Debugf("launch worker command args: [ssh, %s]", strings.Join(shellescape.EscapeArgs(argsBk), ", "))
+			cmd = exec.Command("ssh", shellescape.EscapeArgs(args)...)
+			cmd.Stdin = os.Stdin
 			stderr, err := cmd.StderrPipe()
 			if err != nil {
 				logger.Errorf("redirect stderr: %s", err)
@@ -268,17 +296,20 @@ func launchWorker(address string, config *Config, wg *sync.WaitGroup) {
 				return
 			}
 			logger.Infof("launch a worker on %s", host)
+			var finished = make(chan struct{})
 			go func() {
 				r := bufio.NewReader(stderr)
 				for {
 					line, err := r.ReadString('\n')
 					if err != nil || len(line) == 0 {
+						finished <- struct{}{}
 						return
 					}
 					println(host, line[:len(line)-1])
 				}
 			}()
 			err = cmd.Wait()
+			<-finished
 			if err != nil {
 				logger.Errorf("%s: %s", host, err)
 			}
@@ -289,7 +320,16 @@ func launchWorker(address string, config *Config, wg *sync.WaitGroup) {
 func marshalObjects(objs []object.Object) ([]byte, error) {
 	var arr []map[string]interface{}
 	for _, o := range objs {
-		arr = append(arr, object.MarshalObject(o))
+		obj := object.MarshalObject(o)
+		switch oo := o.(type) {
+		case *withSize:
+			obj["nsize"] = oo.nsize
+			obj["size"] = oo.Object.Size()
+		case *withFSize:
+			obj["fnsize"] = oo.nsize
+			obj["size"] = oo.File.Size()
+		}
+		arr = append(arr, obj)
 	}
 	return json.MarshalIndent(arr, "", " ")
 }
@@ -302,7 +342,13 @@ func unmarshalObjects(d []byte) ([]object.Object, error) {
 	}
 	var objs []object.Object
 	for _, m := range arr {
-		objs = append(objs, object.UnmarshalObject(m))
+		obj := object.UnmarshalObject(m)
+		if nsize, ok := m["nsize"]; ok {
+			obj = &withSize{obj, int64(nsize.(float64))}
+		} else if fnsize, ok := m["fnsize"]; ok {
+			obj = &withFSize{obj.(object.File), int64(fnsize.(float64))}
+		}
+		objs = append(objs, obj)
 	}
 	return objs, nil
 }

@@ -23,8 +23,11 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/dustin/go-humanize"
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
+	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
 )
 
@@ -43,58 +46,62 @@ Examples:
 $ juicefs config redis://localhost
 
 # Change volume "quota"
-$ juicefs config redis://localhost --inode 10000000 --capacity 1048576
+$ juicefs config redis://localhost --inodes 10000000 --capacity 1048576
 
 # Change maximum days before files in trash are deleted
 $ juicefs config redis://localhost --trash-days 7
 
 # Limit client version that is allowed to connect
 $ juicefs config redis://localhost --min-client-version 1.0.0 --max-client-version 1.1.0`,
-		Flags: []cli.Flag{
-			&cli.Uint64Flag{
-				Name:  "capacity",
-				Usage: "hard quota of the volume limiting its usage of space in GiB",
-			},
-			&cli.Uint64Flag{
-				Name:  "inodes",
-				Usage: "hard quota of the volume limiting its number of inodes",
-			},
-			&cli.StringFlag{
-				Name:  "bucket",
-				Usage: "the bucket URL of object storage to store data",
-			},
-			&cli.StringFlag{
-				Name:  "access-key",
-				Usage: "access key for object storage",
-			},
-			&cli.StringFlag{
-				Name:  "secret-key",
-				Usage: "secret key for object storage",
-			},
-			&cli.StringFlag{
-				Name:  "session-token",
-				Usage: "session token for object storage",
-			},
-			&cli.BoolFlag{
-				Name:  "encrypt-secret",
-				Usage: "encrypt the secret key if it was previously stored in plain format",
-			},
-			&cli.IntFlag{
-				Name:  "trash-days",
-				Usage: "number of days after which removed files will be permanently deleted",
-			},
-			&cli.StringFlag{
-				Name:  "min-client-version",
-				Usage: "minimum client version allowed to connect",
-			},
-			&cli.StringFlag{
-				Name:  "max-client-version",
-				Usage: "maximum client version allowed to connect",
-			},
-			&cli.BoolFlag{
-				Name:  "force",
-				Usage: "skip sanity check and force update the configurations",
-			},
+		Flags: expandFlags(
+			formatStorageFlags(),
+			addCategories("DATA STORAGE", []cli.Flag{
+				&cli.StringFlag{
+					Name:  "upload-limit",
+					Usage: "default bandwidth limit of a client for upload in Mbps",
+				},
+				&cli.StringFlag{
+					Name:  "download-limit",
+					Usage: "default bandwidth limit of a client for download in Mbps",
+				},
+			}),
+			formatManagementFlags(),
+			configManagementFlags(),
+			configFlags()),
+	}
+}
+
+func configManagementFlags() []cli.Flag {
+	return addCategories("MANAGEMENT", []cli.Flag{
+		&cli.BoolFlag{
+			Name:  "encrypt-secret",
+			Usage: "encrypt the secret key if it was previously stored in plain format",
+		},
+		&cli.StringFlag{
+			Name:  "min-client-version",
+			Usage: "minimum client version allowed to connect",
+		},
+		&cli.StringFlag{
+			Name:  "max-client-version",
+			Usage: "maximum client version allowed to connect",
+		},
+		&cli.BoolFlag{
+			Name:  "dir-stats",
+			Usage: "enable dir stats, which is necessary for fast summary and dir quota",
+		},
+	})
+}
+
+func configFlags() []cli.Flag {
+	return []cli.Flag{
+		&cli.BoolFlag{
+			Name:    "yes",
+			Aliases: []string{"y"},
+			Usage:   "automatically answer 'yes' to all prompts and run non-interactively",
+		},
+		&cli.BoolFlag{
+			Name:  "force",
+			Usage: "skip sanity check and force update the configurations",
 		},
 	}
 }
@@ -121,7 +128,7 @@ func userConfirmed() bool {
 func config(ctx *cli.Context) error {
 	setup(ctx, 1)
 	removePassword(ctx.Args().Get(0))
-	m := meta.NewClient(ctx.Args().Get(0), &meta.Config{Retries: 10, Strict: true})
+	m := meta.NewClient(ctx.Args().Get(0), nil)
 
 	format, err := m.Load(false)
 	if err != nil {
@@ -132,22 +139,31 @@ func config(ctx *cli.Context) error {
 		return nil
 	}
 
+	originDirStats := format.DirStats
 	var quota, storage, trash, clientVer bool
 	var msg strings.Builder
 	encrypted := format.KeyEncrypted
 	for _, flag := range ctx.LocalFlagNames() {
 		switch flag {
 		case "capacity":
-			if new := ctx.Uint64(flag); new != format.Capacity>>30 {
-				msg.WriteString(fmt.Sprintf("%10s: %d GiB -> %d GiB\n", flag, format.Capacity>>30, new))
-				format.Capacity = new << 30
+			if new := utils.ParseBytes(ctx, flag, 'G'); new != format.Capacity {
+				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag,
+					humanize.IBytes(format.Capacity), humanize.IBytes(new)))
+				format.Capacity = new
 				quota = true
 			}
 		case "inodes":
 			if new := ctx.Uint64(flag); new != format.Inodes {
-				msg.WriteString(fmt.Sprintf("%10s: %d -> %d\n", flag, format.Inodes, new))
+				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag,
+					humanize.Comma(int64(format.Inodes)), humanize.Comma(int64(new))))
 				format.Inodes = new
 				quota = true
+			}
+		case "storage":
+			if new := ctx.String(flag); new != format.Storage {
+				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, format.Storage, new))
+				format.Storage = new
+				storage = true
 			}
 		case "bucket":
 			if new := ctx.String(flag); new != format.Bucket {
@@ -182,6 +198,22 @@ func config(ctx *cli.Context) error {
 			}
 			format.SessionToken = ctx.String(flag)
 			storage = true
+		case "storage-class": // always update
+			if new := ctx.String(flag); new != format.StorageClass {
+				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, format.StorageClass, new))
+				format.StorageClass = new
+				storage = true
+			}
+		case "upload-limit":
+			if new := utils.ParseMbps(ctx, flag); new != format.UploadLimit {
+				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, utils.Mbps(format.UploadLimit), utils.Mbps(new)))
+				format.UploadLimit = new
+			}
+		case "download-limit":
+			if new := utils.ParseMbps(ctx, flag); new != format.DownloadLimit {
+				msg.WriteString(fmt.Sprintf("%10s: %s -> %s\n", flag, utils.Mbps(format.DownloadLimit), utils.Mbps(new)))
+				format.DownloadLimit = new
+			}
 		case "trash-days":
 			if new := ctx.Int(flag); new != format.TrashDays {
 				if new < 0 {
@@ -190,6 +222,11 @@ func config(ctx *cli.Context) error {
 				msg.WriteString(fmt.Sprintf("%10s: %d -> %d\n", flag, format.TrashDays, new))
 				format.TrashDays = new
 				trash = true
+			}
+		case "dir-stats":
+			if new := ctx.Bool(flag); new != format.DirStats {
+				msg.WriteString(fmt.Sprintf("%10s: %t -> %t\n", flag, format.DirStats, new))
+				format.DirStats = new
 			}
 		case "min-client-version":
 			if new := ctx.String(flag); new != format.MinClientVersion {
@@ -209,6 +246,18 @@ func config(ctx *cli.Context) error {
 				format.MaxClientVersion = new
 				clientVer = true
 			}
+		case "enable-acl":
+			if enableACL := ctx.Bool(flag); enableACL != format.EnableACL {
+				if enableACL {
+					msg.WriteString(fmt.Sprintf("%s: %v -> %v\n", flag, format.EnableACL, true))
+					msg.WriteString(fmt.Sprintf("%s: %s -> %s\n", "min-client-version", format.MinClientVersion, "1.2.0-A"))
+					format.EnableACL = true
+					format.MinClientVersion = "1.2.0-A"
+					clientVer = true
+				} else {
+					return errors.New("cannot disable acl")
+				}
+			}
 		}
 	}
 	if msg.Len() == 0 {
@@ -217,6 +266,7 @@ func config(ctx *cli.Context) error {
 	}
 
 	if !ctx.Bool("force") {
+		yes := ctx.Bool("yes")
 		if storage {
 			blob, err := createStorage(*format)
 			if err != nil {
@@ -228,27 +278,56 @@ func config(ctx *cli.Context) error {
 		}
 		if quota {
 			var totalSpace, availSpace, iused, iavail uint64
-			_ = m.StatFS(meta.Background, &totalSpace, &availSpace, &iused, &iavail)
+			_ = m.StatFS(meta.Background(), meta.RootInode, &totalSpace, &availSpace, &iused, &iavail)
 			usedSpace := totalSpace - availSpace
 			if format.Capacity > 0 && usedSpace >= format.Capacity ||
 				format.Inodes > 0 && iused >= format.Inodes {
 				warn("New quota is too small (used / quota): %d / %d bytes, %d / %d inodes.",
 					usedSpace, format.Capacity, iused, format.Inodes)
-				if !userConfirmed() {
+				if !yes && !userConfirmed() {
 					return fmt.Errorf("Aborted.")
 				}
 			}
 		}
 		if trash && format.TrashDays == 0 {
 			warn("The current trash will be emptied and future removed files will purged immediately.")
-			if !userConfirmed() {
+			if !yes && !userConfirmed() {
 				return fmt.Errorf("Aborted.")
 			}
 		}
-		if clientVer && format.CheckVersion() != nil {
-			warn("Clients with the same version of this will be rejected after modification.")
-			if !userConfirmed() {
-				return fmt.Errorf("Aborted.")
+		if originDirStats && !format.DirStats {
+			qs := make(map[string]*meta.Quota)
+			err := m.HandleQuota(meta.Background(), meta.QuotaList, "", qs, false, false, false)
+			if err != nil {
+				return errors.Wrap(err, "list quotas")
+			}
+			if len(qs) != 0 {
+				paths := make([]string, 0, len(qs))
+				for path := range qs {
+					paths = append(paths, path)
+				}
+				return fmt.Errorf("cannot disable dir stats when there are still %d dir quotas: %v", len(qs), paths)
+			}
+		}
+		if clientVer {
+			if format.CheckVersion() != nil {
+				warn("Clients with the same version of this will be rejected after modification.")
+				if !yes && !userConfirmed() {
+					return fmt.Errorf("Aborted.")
+				}
+			}
+
+			// check all clients
+			if sessions, err := m.ListSessions(); err == nil {
+				warnMsg := ""
+				for _, session := range sessions {
+					if err := format.CheckCliVersion(version.Parse(session.Version)); err != nil {
+						warnMsg += fmt.Sprintf("host %s pid %d client version error: %s\n", session.HostName, session.ProcessID, err)
+					}
+				}
+				if warnMsg != "" {
+					fmt.Println(warnMsg)
+				}
 			}
 		}
 	}
@@ -258,7 +337,7 @@ func config(ctx *cli.Context) error {
 			logger.Fatalf("Format encrypt: %s", err)
 		}
 	}
-	if err = m.Init(*format, false); err == nil {
+	if err = m.Init(format, false); err == nil {
 		fmt.Println(msg.String()[:msg.Len()-1])
 	}
 	return err

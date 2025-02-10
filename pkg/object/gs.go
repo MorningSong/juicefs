@@ -25,7 +25,11 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/storage"
@@ -36,22 +40,30 @@ import (
 
 type gs struct {
 	DefaultObjectStorage
-	client    *storage.Client
-	bucket    string
-	region    string
-	pageToken string
+	clients []*storage.Client
+	index   uint64
+	bucket  string
+	region  string
+	sc      string
 }
 
 func (g *gs) String() string {
 	return fmt.Sprintf("gs://%s/", g.bucket)
 }
 
+func (g *gs) getClient() *storage.Client {
+	if len(g.clients) == 1 {
+		return g.clients[0]
+	}
+	n := atomic.AddUint64(&g.index, 1)
+	return g.clients[n%(uint64(len(g.clients)))]
+}
+
 func (g *gs) Create() error {
 	// check if the bucket is already exists
-	if objs, err := g.List("", "", 1); err == nil && len(objs) > 0 {
+	if objs, _, _, err := g.List("", "", "", "", 1, true); err == nil && len(objs) > 0 {
 		return nil
 	}
-
 	projectID := os.Getenv("GOOGLE_CLOUD_PROJECT")
 	if projectID == "" {
 		projectID, _ = metadata.ProjectID()
@@ -71,14 +83,11 @@ func (g *gs) Create() error {
 		if err == nil && len(zone) > 2 {
 			g.region = zone[:len(zone)-2]
 		}
-		if g.region == "" {
-			return errors.New("Could not guess region to create bucket")
-		}
 	}
 
-	err := g.client.Bucket(g.bucket).Create(ctx, projectID, &storage.BucketAttrs{
+	err := g.getClient().Bucket(g.bucket).Create(ctx, projectID, &storage.BucketAttrs{
 		Name:         g.bucket,
-		StorageClass: "regional",
+		StorageClass: g.sc,
 		Location:     g.region,
 	})
 	if err != nil && strings.Contains(err.Error(), "You already own this bucket") {
@@ -88,7 +97,7 @@ func (g *gs) Create() error {
 }
 
 func (g *gs) Head(key string) (Object, error) {
-	attrs, err := g.client.Bucket(g.bucket).Object(key).Attrs(ctx)
+	attrs, err := g.getClient().Bucket(g.bucket).Object(key).Attrs(ctx)
 	if err != nil {
 		if err == storage.ErrObjectNotExist {
 			err = os.ErrNotExist
@@ -101,60 +110,87 @@ func (g *gs) Head(key string) (Object, error) {
 		attrs.Size,
 		attrs.Updated,
 		strings.HasSuffix(key, "/"),
+		attrs.StorageClass,
 	}, nil
 }
 
-func (g *gs) Get(key string, off, limit int64) (io.ReadCloser, error) {
-	reader, err := g.client.Bucket(g.bucket).Object(key).NewRangeReader(ctx, off, limit)
+func (g *gs) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
+	reader, err := g.getClient().Bucket(g.bucket).Object(key).NewRangeReader(ctx, off, limit)
 	if err != nil {
 		return nil, err
 	}
+	// TODO fire another attr request to get the actual storage class
+	attrs := applyGetters(getters...)
+	attrs.SetStorageClass(g.sc)
 	return reader, nil
 }
 
-func (g *gs) Put(key string, data io.Reader) error {
-	writer := g.client.Bucket(g.bucket).Object(key).NewWriter(ctx)
-	_, err := io.Copy(writer, data)
+func (g *gs) Put(key string, data io.Reader, getters ...AttrGetter) error {
+	writer := g.getClient().Bucket(g.bucket).Object(key).NewWriter(ctx)
+	writer.StorageClass = g.sc
+
+	// If you upload small objects (< 16MiB), you should set ChunkSize
+	// to a value slightly larger than the objects' sizes to avoid memory bloat.
+	// This is especially important if you are uploading many small objects concurrently.
+	writer.ChunkSize = 5 << 20
+
+	buf := bufPool.Get().(*[]byte)
+	defer bufPool.Put(buf)
+	_, err := io.CopyBuffer(writer, data, *buf)
 	if err != nil {
 		return err
 	}
+	attrs := applyGetters(getters...)
+	attrs.SetStorageClass(g.sc)
 	return writer.Close()
 }
 
 func (g *gs) Copy(dst, src string) error {
-	srcObj := g.client.Bucket(g.bucket).Object(src)
-	dstObj := g.client.Bucket(g.bucket).Object(dst)
-	_, err := dstObj.CopierFrom(srcObj).Run(ctx)
+	client := g.getClient()
+	srcObj := client.Bucket(g.bucket).Object(src)
+	dstObj := client.Bucket(g.bucket).Object(dst)
+	copier := dstObj.CopierFrom(srcObj)
+	if g.sc != "" {
+		copier.StorageClass = g.sc
+	}
+	_, err := copier.Run(ctx)
 	return err
 }
 
-func (g *gs) Delete(key string) error {
-	if err := g.client.Bucket(g.bucket).Object(key).Delete(ctx); err != storage.ErrObjectNotExist {
+func (g *gs) Delete(key string, getters ...AttrGetter) error {
+	if err := g.getClient().Bucket(g.bucket).Object(key).Delete(ctx); err != storage.ErrObjectNotExist {
 		return err
 	}
 	return nil
 }
 
-func (g *gs) List(prefix, marker string, limit int64) ([]Object, error) {
-	if marker != "" && g.pageToken == "" {
-		// last page
-		return nil, nil
-	}
-	objectIterator := g.client.Bucket(g.bucket).Objects(ctx, &storage.Query{Prefix: prefix})
-	pager := iterator.NewPager(objectIterator, int(limit), g.pageToken)
+func (g *gs) List(prefix, start, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
+	objectIterator := g.getClient().Bucket(g.bucket).Objects(ctx, &storage.Query{Prefix: prefix, Delimiter: delimiter, StartOffset: start})
+	pager := iterator.NewPager(objectIterator, int(limit), token)
 	var entries []*storage.ObjectAttrs
 	nextPageToken, err := pager.NextPage(&entries)
 	if err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
-	g.pageToken = nextPageToken
 	n := len(entries)
 	objs := make([]Object, n)
 	for i := 0; i < n; i++ {
 		item := entries[i]
-		objs[i] = &obj{item.Name, item.Size, item.Updated, strings.HasSuffix(item.Name, "/")}
+		if delimiter != "" && item.Prefix != "" {
+			objs[i] = &obj{item.Prefix, 0, time.Unix(0, 0), true, item.StorageClass}
+		} else {
+			objs[i] = &obj{item.Name, item.Size, item.Updated, strings.HasSuffix(item.Name, "/"), item.StorageClass}
+		}
 	}
-	return objs, nil
+	if delimiter != "" {
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
+	}
+	return objs, nextPageToken != "", nextPageToken, nil
+}
+
+func (g *gs) SetStorageClass(sc string) error {
+	g.sc = sc
+	return nil
 }
 
 func newGS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {
@@ -172,11 +208,25 @@ func newGS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) 
 		region = hostParts[1]
 	}
 
-	client, err := storage.NewClient(ctx)
-	if err != nil {
-		return nil, err
+	var size int
+	if ssize := os.Getenv("JFS_NUM_GOOGLE_CLIENTS"); ssize != "" {
+		if size, err = strconv.Atoi(ssize); err != nil {
+			return nil, err
+		}
 	}
-	return &gs{client: client, bucket: bucket, region: region}, nil
+	if size < 1 {
+		size = 5
+	}
+	clis := make([]*storage.Client, size)
+	for i := 0; i < size; i++ {
+		client, err := storage.NewClient(ctx)
+		if err != nil {
+			return nil, err
+		}
+		clis[i] = client
+	}
+
+	return &gs{clients: clis, bucket: bucket, region: region}, nil
 }
 
 func init() {

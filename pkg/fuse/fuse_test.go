@@ -24,7 +24,6 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -45,13 +44,14 @@ import (
 )
 
 func format(url string) {
-	m := meta.NewClient(url, &meta.Config{})
-	format := meta.Format{
+	m := meta.NewClient(url, nil)
+	format := &meta.Format{
 		Name:      "test",
 		UUID:      uuid.New().String(),
 		Storage:   "file",
 		Bucket:    os.TempDir() + "/",
 		BlockSize: 4096,
+		DirStats:  true,
 	}
 	err := m.Init(format, true)
 	if err != nil {
@@ -64,11 +64,8 @@ func mount(url, mp string) {
 		log.Fatalf("create %s: %s", mp, err)
 	}
 
-	metaConf := &meta.Config{
-		Retries:    10,
-		Strict:     true,
-		MountPoint: mp,
-	}
+	metaConf := meta.DefaultConf()
+	metaConf.MountPoint = mp
 	m := meta.NewClient(url, metaConf)
 	format, err := m.Load(true)
 	if err != nil {
@@ -98,12 +95,13 @@ func mount(url, mp string) {
 	}))
 
 	conf := &vfs.Config{
-		Meta:   metaConf,
-		Format: format,
-		Chunk:  &chunkConf,
+		Meta:     metaConf,
+		Format:   *format,
+		Chunk:    &chunkConf,
+		FuseOpts: &vfs.FuseOptions{},
 	}
 
-	err = m.NewSession()
+	err = m.NewSession(true)
 	if err != nil {
 		log.Fatalf("new session: %s", err)
 	}
@@ -113,7 +111,7 @@ func mount(url, mp string) {
 	conf.DirEntryTimeout = time.Second
 	conf.HideInternal = true
 	v := vfs.NewVFS(conf, m, store, nil, nil)
-	err = Serve(v, "", true)
+	err = Serve(v, "", true, true)
 	if err != nil {
 		log.Fatalf("fuse server err: %s\n", err)
 	}
@@ -197,7 +195,7 @@ func StatFS(t *testing.T, mp string) {
 
 func Xattrs(t *testing.T, mp string) {
 	path := filepath.Join(mp, "myfile")
-	ioutil.WriteFile(path, []byte(""), 0644)
+	os.WriteFile(path, []byte(""), 0644)
 
 	const prefix = "user."
 	var value = []byte("test-attr-value")
@@ -224,7 +222,7 @@ func Xattrs(t *testing.T, mp string) {
 
 func Flock(t *testing.T, mp string) {
 	path := filepath.Join(mp, "go-lock.lock")
-	ioutil.WriteFile(path, []byte(""), 0644)
+	os.WriteFile(path, []byte(""), 0644)
 
 	fileLock := flock.New(path)
 	locked, err := fileLock.TryLock()
@@ -292,6 +290,8 @@ func TestFUSE(t *testing.T) {
 	t.Run("StatFS", func(t *testing.T) {
 		StatFS(t, mp)
 	})
+	delete(posixtest.All, "FdLeak")
+	delete(posixtest.All, "FcntlFlockLocksFile") // FIXME: check gofuse in posixtest/posixtest_test.go
 	posixtest.All["Xattrs"] = Xattrs
 	posixtest.All["Flock"] = Flock
 	posixtest.All["POSIXLock"] = PosixLock

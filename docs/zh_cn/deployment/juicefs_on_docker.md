@@ -1,107 +1,235 @@
 ---
-sidebar_label: Docker 使用 JuiceFS
-sidebar_position: 2
+title: 在 Docker 中使用 JuiceFS
+sidebar_position: 6
 slug: /juicefs_on_docker
+description: 在 Docker 中以不同方式使用 JuiceFS，包括卷映射、卷插件，以及容器中挂载。
 ---
-# 在 Docker 使用 JuiceFS
 
-目前有三种在 Docker 上使用 JuiceFS 存储的方法：
+在 Docker 中使用 JuiceFS 文件系统，可以通过卷插件或直接在容器中运行客户端。
 
-## 1. 卷映射
+## 使用卷插件 {#volume-plugin}
 
-这种方法是将 JuiceFS 挂载点中的目录映射给 Docker 容器。比如，JuiceFS 文件系统挂载在 `/mnt/jfs` 目录，在创建容器时可以这样将 JuiceFS 存储映射到 Docker 容器：
+如果你对挂载管理有一定要求，比如希望通过 Docker 来管理挂载点，方便不同的应用容器使用不同的 JuiceFS 文件系统，则可以使用[卷插件](https://github.com/juicedata/docker-volume-juicefs)（Docker volume plugin）。
+
+Docker 插件通常是以镜像形式提供的，[JuiceFS 卷插件镜像](https://hub.docker.com/r/juicedata/juicefs)中内置了 [JuiceFS 社区版](../introduction/README.md)和 [JuiceFS 云服务](https://juicefs.com/docs/zh/cloud)客户端，安装以后，便能够运行卷插件，在 Docker 中创建 JuiceFS Volume。
+
+通过下面的命令安装插件，按照提示为 FUSE 提供必要的权限：
+
+```shell
+docker plugin install juicedata/juicefs
+```
+
+你可以使用以下命令管理卷插件：
+
+```shell
+# 停用插件
+docker plugin disable juicedata/juicefs
+
+# 升级插件（需先停用）
+docker plugin upgrade juicedata/juicefs
+docker plugin enable juicedata/juicefs
+
+# 卸载插件
+docker plugin rm juicedata/juicefs
+```
+
+### 创建存储卷 {#create-volume}
+
+请将以下命令中的 `<VOLUME_NAME>`、`<META_URL>`、`<STORAGE_TYPE>`、`<BUCKET_NAME>`、`<ACCESS_KEY>`、`<SECRET_KEY>` 替换成你自己的文件系统配置。
+
+```shell
+docker volume create -d juicedata/juicefs \
+  -o name=<VOLUME_NAME> \
+  -o metaurl=<META_URL> \
+  -o storage=<STORAGE_TYPE> \
+  -o bucket=<BUCKET_NAME> \
+  -o access-key=<ACCESS_KEY> \
+  -o secret-key=<SECRET_KEY> \
+  jfsvolume
+```
+
+对于已经预先创建好的文件系统，在用其创建卷插件时，只需指定文件系统名称和数据库地址，例如：
+
+```shell
+docker volume create -d juicedata/juicefs \
+  -o name=<VOLUME_NAME> \
+  -o metaurl=<META_URL> \
+  jfsvolume
+```
+
+如果需要在挂载文件系统时传入额外的环境变量（比如 [Google 云](../reference/how_to_set_up_object_storage.md#google-cloud)），可以对上方命令追加类似 `-o env=FOO=bar,SPAM=egg` 的参数。
+
+### 使用和管理 {#usage-and-management}
+
+```shell
+# 创建容器时挂载卷
+docker run -it -v jfsvolume:/opt busybox ls /opt
+
+# 卸载后，可以操作删除存储卷，注意这仅仅是删除 Docker 中的对应资源，并不影响 JuiceFS 中存储的数据
+docker volume rm jfsvolume
+```
+
+### 在 Docker Compose 中使用卷插件  {#using-plugin-in-docker-compose}
+
+下面是在 `docker compose` 中使用 JuiceFS 卷插件的示例：
+
+```yaml
+version: '3'
+services:
+busybox:
+  image: busybox
+  command: "ls /jfs"
+  volumes:
+    - jfsvolume:/jfs
+volumes:
+  jfsvolume:
+    driver: juicedata/juicefs
+    driver_opts:
+      name: ${VOL_NAME}
+      # 因为 SQLite 在插件容器本地路径创建数据库文件，
+      # sqlite:// 将在服务重启时失败。
+      # （详见 https://github.com/juicedata/docker-volume-juicefs/issues/37）
+      metaurl: ${META_URL}
+      storage: ${STORAGE_TYPE}
+      bucket: ${BUCKET}
+      access-key: ${ACCESS_KEY}
+      secret-key: ${SECRET_KEY}
+      # 如有需要，可以用 env 传入额外环境变量
+      # env: FOO=bar,SPAM=egg
+```
+
+使用和管理：
+
+```shell
+# 启动服务
+docker-compose up
+
+# 关闭服务并从 Docker 中卸载 JuiceFS 文件系统
+docker-compose down --volumes
+```
+
+### 卷插件问题排查 {#troubleshooting}
+
+无法正常工作时，推荐先[升级卷插件](#volume-plugin)，然后根据问题情况查看日志。
+
+* 收集 JuiceFS 客户端日志，日志位于 Docker volume plugin 容器内，需要进入容器采集：
+
+  ```shell
+  # 确认 docker plugins runtime 目录，根据实际情况可能与下方示范不同
+  # ls 打印出来的目录就是容器目录，名称为容器 ID
+  ls /run/docker/plugins/runtime-root/plugins.moby
+
+  # 打印 plugin 容器信息
+  # 如果打印出的容器列表为空，说明 plugin 容器创建失败
+  # 阅读下方查看 plugin 启动日志继续排查
+  runc --root /run/docker/plugins/runtime-root/plugins.moby list
+
+  # 进入容器，打印日志
+  runc --root /run/docker/plugins/runtime-root/plugins.moby exec 452d2c0cf3fd45e73a93a2f2b00d03ed28dd2bc0c58669cca9d4039e8866f99f cat /var/log/juicefs.log
+  ```
+
+  如果发现容器不存在（`ls` 发现目录为空），或者在最后打印日志的阶段发现 `juicefs.log` 不存在，那么多半是挂载本身就失败了，继续查看 plugin 自身的日志寻找原因。
+
+* 收集 plugin 日志，以 systemd 为例：
+
+  ```shell
+  journalctl -f -u docker | grep "plugin="
+  ```
+
+  如果 plugin 调用 `juicefs` 发生错误，或者 plugin 自身报错，均会在日志里有所体现。
+
+## 在容器中使用 JuiceFS 客户端 {#mount-juicefs-in-docker}
+
+相比卷插件，直接在容器中使用 JuiceFS 客户端更加灵活，可以在容器中直接挂载 JuiceFS 文件系统，也可以通过 S3 Gateway、WebDAV 开放文件系统访问。
+
+### 方式一：自行构建镜像
+
+JuiceFS 客户端是一个独立的二进制程序，同时提供 AMD64 和 ARM64 架构的版本，可以在 Dockerfile 中定义下载安装 JuiceFS 客户端的命令，例如：
+
+```Dockerfile
+FROM ubuntu:22.04
+...
+# 使用官方一键安装脚本
+RUN curl -sSL https://d.juicefs.com/install | sh - 
+```
+
+更多内容详见[「定制容器镜像」](https://juicefs.com/docs/zh/csi/guide/custom-image)。
+
+### 方式二：使用官方维护的镜像
+
+JuiceFS 官方维护的镜像 [`juicedata/mount`](https://hub.docker.com/r/juicedata/mount) ，可以通过 tag 指定所需要的版本。**社区版 tag 为 ce**，例如：latest、ce-v1.1.2、ce-nightly。`latest` 标签仅包含最新的社区版，`nightly` 标签指向最新的开发版本，详情查看 [Docker hub 的 tags 页面](https://hub.docker.com/r/juicedata/mount/tags)。
+
+开始之前，你需要先准备好[对象存储](../reference/how_to_set_up_object_storage.md)和[元数据引擎](../reference/how_to_set_up_metadata_engine.md)。
+
+#### 创建文件系统
+
+通过一个临时容器创建文件系统，例如：
 
 ```sh
-sudo docker run -d --name nginx \
-  -v /mnt/jfs/html:/usr/share/nginx/html \
-  -p 8080:80 \
-  nginx
+docker run --rm \
+    juicedata/mount:ce-v1.1.2 juicefs format \
+    --storage s3 \
+    --bucket https://xxx.your-s3-endpoint.com \
+    --access-key=ACCESSKEY \
+    --secret-key=SECRETKEY \
+    rediss://user:password@xxx.your-redis-server.com:6379/1 myjfs
 ```
 
-但需要注意，默认情况下，只有挂载 JuiceFS 存储的用户有存储的读写权限，当你需要将 JuiceFS 存储映射给 Docker 容器使用时，如果你没有使用 root 身份挂载 JuiceFS 存储，则需要先开启 FUSE 的 `user_allow_other` 选项，然后再添加  `-o allow_other` 选项重新挂载 JuiceFS 文件系统。
+请将 `--storage`、`--bucket`、`--access-key`、`--secret-key` 以及元数据引擎的 URL 替换成你自己的配置。
 
-> **注意**：使用 root 用户身份或使用 sudo 挂载的 JuiceFS 存储，会自动添加 `allow_other` 选项，无需手动设置。
+#### 直接在容器中挂载文件系统
 
-### FUSE 设置
-
-默认情况下，`allow_other` 选项只允许 root 用户使用，为了让普通用户也有权限使用该挂载选项，需要修改 FUSE 的配置文件。
-
-#### 修改配置文件
-
-编辑 FUSE 的配置文件，通常是 `/etc/fuse.conf`：
+创建一个容器并将 JuiceFS 文件系统到挂载到容器中，例如：
 
 ```sh
-sudo nano /etc/fuse.conf
+docker run --privileged --name myjfs \
+    juicedata/mount:ce-v1.1.2 juicefs mount \
+    rediss://user:password@xxx.your-redis-server.com:6379/1 /mnt
 ```
 
-将配置文件中的 `user_allow_other` 前面的 `#` 注释符删掉，修改后类似下面这样：
+请将元数据引擎的 URL 替换成你自己的配置，`/mnt` 是挂载点，可以根据需要修改。由于需要使用 FUSE，所以还需要 `--privileged` 权限。
 
-```conf
-# /etc/fuse.conf - Configuration file for Filesystem in Userspace (FUSE)
+#### 通过 Docker Compose 挂载文件系统
 
-# Set the maximum number of FUSE mounts allowed to non-root users.
-# The default is 1000.
-#mount_max = 1000
+下面是一个使用 Docker Compose 的示例，请将元数据引擎的 URL 和挂载点替换成你自己的配置。
 
-# Allow non-root users to specify the allow_other or allow_root mount options.
-user_allow_other
+```yaml
+version: "3"
+services:
+    juicefs:
+      image: juicedata/mount:ce-v1.1.2
+      container_name: myjfs
+      volumes:
+        - ./mnt:/mnt:rw,rshared
+      cap_add:
+        - SYS_ADMIN
+      devices:
+        - /dev/fuse
+      security_opt: 
+        - apparmor:unconfined
+      command: ["juicefs", "mount", "rediss://user:password@xxx.your-redis-server.com:6379/1", "/mnt"]
+      restart: unless-stopped
 ```
 
-### 重新挂载 JuiceFS
+在容器中，JuiceFS 文件系统挂载到了 `/mnt` 目录，又通过配置文件中的 volumes 部分将容器中的 `/mnt` 映射到宿主机的 `./mnt` 目录，这样就可以实现在宿主机直接访问容器中挂载的 JuiceFS 文件系统。
 
-FUSE 的 `user_allow_other` 启用后，你需要重新挂载 JuiceFS 文件系统，使用 `-o` 选项设置 `allow_other`，例如：
+#### 通过 S3 Gateway 开放文件系统访问
 
-```sh
-juicefs mount -d -o allow_other redis://<your-redis-url>:6379/1 /mnt/jfs
+下面是一个将 JuiceFS 以 S3 Gateway 方式开放访问的示例，请将 `MINIO_ROOT_USER`、`MINIO_ROOT_PASSWORD`、元数据引擎的 URL、监听的地址和端口号替换成你自己的配置。
+
+```yaml
+version: "3"
+services:
+    s3-gateway:
+      image: juicedata/mount:ce-v1.1.2
+      container_name: juicefs-s3-gateway
+      environment:
+        - MINIO_ROOT_USER=your-username
+        - MINIO_ROOT_PASSWORD=your-password
+      ports:
+        - "9090:9090"
+      command: ["juicefs", "gateway", "rediss://user:password@xxx.your-redis-server.com:6379/1", "0.0.0.0:9090"]
+      restart: unless-stopped
 ```
 
-## 2. Docker Volume Plugin
-
-JuiceFS 也支持使用 [volume plugin](https://docs.docker.com/engine/extend/) 方式访问。
-
-```sh
-$ docker plugin install juicedata/juicefs
-Plugin "juicedata/juicefs" is requesting the following privileges:
- - network: [host]
- - device: [/dev/fuse]
- - capabilities: [CAP_SYS_ADMIN]
-Do you grant the above permissions? [y/N]
-
-$ docker volume create -d juicedata/juicefs:latest -o name={{VOLUME_NAME}} -o metaurl={{META_URL}} -o access-key={{ACCESS_KEY}} -o secret-key={{SECRET_KEY}} jfsvolume
-$ docker run -it -v jfsvolume:/opt busybox ls /opt
-```
-
-将上面 `{{VOLUME_NAME}}`、`{{META_URL}}`、`{{ACCESS_KEY}}`、`{{SECRET_KEY}}` 替换成你自己的文件系统配置。想要了解更多 JuiceFS 卷插件内容，可以访问  [juicedata/docker-volume-juicefs](https://github.com/juicedata/docker-volume-juicefs) 代码仓库。
-
-## 3. 在 Docker 容器中挂载 JuiceFS
-
-这种方法是将 JuiceFS 文件系统直接在 Docker 容器中进行挂载和使用，相比第一种方式，在容器中直接挂载 JuiceFS 可以缩小文件被误操作的几率。谁使用谁挂载，也让容器管理更清晰直观。
-
-由于在容器中进行文件系统挂载需要将 JuiceFS 客户端拷贝到容器，在常规的容器管理过程中，需要把下载或拷贝 JuiceFS 客户端以及挂载文件系统的过程写入 Dockerfile，然后重新构建镜像。例如，你可以参考以下 Dockerfile，将 JuiceFS 客户端打包到 Alpine 镜像。
-
-```dockerfile
-FROM alpine:latest
-LABEL maintainer="Juicedata <https://juicefs.com>"
-
-# Install JuiceFS client
-RUN apk add --no-cache curl && \
-  JFS_LATEST_TAG=$(curl -s https://api.github.com/repos/juicedata/juicefs/releases/latest | grep 'tag_name' | cut -d '"' -f 4 | tr -d 'v') && \
-  wget "https://github.com/juicedata/juicefs/releases/download/v${JFS_LATEST_TAG}/juicefs-${JFS_LATEST_TAG}-linux-amd64.tar.gz" && \
-  tar -zxf "juicefs-${JFS_LATEST_TAG}-linux-amd64.tar.gz" && \
-  install juicefs /usr/bin && \
-  rm juicefs "juicefs-${JFS_LATEST_TAG}-linux-amd64.tar.gz" && \
-  rm -rf /var/cache/apk/* && \
-  apk del curl
-
-ENTRYPOINT ["/usr/bin/juicefs", "mount"]
-```
-
-另外，由于在容器中使用 FUSE 需要相应的权限，在创建容器时，需要指定 `--privileged=true` 选项，比如：
-
-```sh
-sudo docker run -d --name nginx \
-  -v /mnt/jfs/html:/usr/share/nginx/html \
-  -p 8080:80 \
-  --privileged=true \
-  nginx-with-jfs
-```
+使用宿主机的 `9090` 端口即可打开 S3 Gateway 的控制台，用相同的地址通过 S3 客户端或者 SDK 读写 JuiceFS 文件系统。
