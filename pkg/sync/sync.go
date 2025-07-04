@@ -31,6 +31,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -220,10 +221,27 @@ var bufPool = sync.Pool{
 	},
 }
 
+func shouldRetry(err error) bool {
+	if err == nil || errors.Is(err, utils.ErrSkipped) || errors.Is(err, utils.ErrExtlink) {
+		return false
+	}
+
+	var eno syscall.Errno
+	if errors.As(err, &eno) {
+		switch eno {
+		case syscall.EAGAIN, syscall.EINTR, syscall.EBUSY, syscall.ETIMEDOUT, syscall.EIO:
+			return true
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func try(n int, f func() error) (err error) {
 	for i := 0; i < n; i++ {
 		err = f()
-		if err == nil || errors.Is(err, utils.ErrSkipped) {
+		if !shouldRetry(err) {
 			return
 		}
 		logger.Debugf("Try %d failed: %s", i+1, err)
@@ -530,6 +548,13 @@ func doCopySingle0(src, dst object.ObjectStorage, key string, size int64, calChk
 	var in io.ReadCloser
 	var err error
 	if size == 0 {
+		if key == "" && !object.IsFileSystem(dst) {
+			ps := strings.SplitN(dst.String(), "/", 4)
+			if len(ps) == 4 && ps[3] == "" {
+				logger.Warnf("empty key is not support by %s, ignore it", dst)
+				return 0, nil
+			}
+		}
 		if object.IsFileSystem(src) {
 			// for check permissions
 			r, err := src.Get(key, 0, -1)
@@ -883,6 +908,10 @@ func worker(tasks <-chan object.Object, src, dst object.ObjectStorage, config *C
 				}
 			} else {
 				srcChksum, err = CopyData(src, dst, key, obj.Size(), config.CheckAll || config.CheckNew)
+			}
+			if errors.Is(err, utils.ErrExtlink) {
+				logger.Warnf("Skip external link %s: %s", key, err)
+				err = utils.ErrSkipped
 			}
 
 			if err == nil && config.CheckChange {

@@ -383,23 +383,29 @@ func newOSS(endpoint, accessKey, secretKey, token string) (ObjectStorage, error)
 		}
 		logger.Debugf("use endpoint %s", domain)
 	}
-	index := strings.Index(domain, ".")
-	if index <= 0 {
-		return nil, fmt.Errorf("invalid endpoint: %s", domain)
+	var regionID string
+	if regionID = os.Getenv("ALICLOUD_REGION_ID"); regionID == "" {
+		index := strings.Index(domain, ".")
+		if index <= 0 {
+			return nil, fmt.Errorf("invalid endpoint: %s", domain)
+		}
+		regionID = strings.TrimPrefix(strings.TrimPrefix(domain[:index], "http://"), "https://")
+		regionID = strings.TrimPrefix(regionID, "oss-")
+		regionID = strings.TrimSuffix(regionID, "-internal")
+		regionID = strings.TrimSuffix(regionID, "-vpc")
 	}
-	_, regionID, found := strings.Cut(domain[:index], "oss-")
-	if !found {
-		return nil, fmt.Errorf("invalid endpoint: %s", domain)
-	}
-	regionID, _ = strings.CutSuffix(regionID, "-internal")
 	config := oss.LoadDefaultConfig()
 	config.Endpoint = oss.Ptr(domain)
 	config.Region = oss.Ptr(regionID)
 	config.RetryMaxAttempts = oss.Ptr(1)
 	config.ConnectTimeout = oss.Ptr(time.Second * 2)
 	config.ReadWriteTimeout = oss.Ptr(time.Second * 5)
-	config.DisableUploadCRC64Check = oss.Ptr(true)
-	config.DisableDownloadCRC64Check = oss.Ptr(true)
+	enableChecksum := strings.EqualFold(uri.Query().Get("disable-checksum"), "false")
+	if enableChecksum {
+		logger.Infof("default CRC checksum is enabled")
+	}
+	config.DisableUploadCRC64Check = oss.Ptr(!enableChecksum)
+	config.DisableDownloadCRC64Check = oss.Ptr(!enableChecksum)
 	config.UserAgent = &UserAgent
 	config.HttpClient = httpClient
 	config.CredentialsProvider = provider
